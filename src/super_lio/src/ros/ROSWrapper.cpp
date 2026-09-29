@@ -1,5 +1,6 @@
 
 #include "ros/ROSWrapper.h"
+#include "lio/scan_validation.h"
 #include "super_lio/CloudPose.h"
 #include "super_lio/CloudPose2.h"
 
@@ -33,6 +34,7 @@ void LoadParamFromRos(ros::NodeHandle& nh){
   nh.getParam("/lio/sensor/maxrange", temp_range_dis);
   g_maxrange2 = temp_range_dis * temp_range_dis;
   nh.getParam("/lio/sensor/filter_rate", g_filter_rate);
+  g_filter_rate = std::max(1, g_filter_rate);
   nh.getParam("/lio/sensor/enable_downsample", g_enable_downsample);
   nh.getParam("/lio/sensor/voxel_fliter_size", g_voxel_fliter_size);
 
@@ -238,6 +240,7 @@ void ROSWrapper::livoxHandler(const livox_ros_driver::CustomMsg::ConstPtr& msg){
   }
   lidar_data.start_time = msg->header.stamp.toSec();
   lidar_data.end_time   = lidar_data.start_time + offset_time;
+  if (!finalizeLidarScan(lidar_data)) return;
   lidar_buffer_.push_back(lidar_data);
 }
 
@@ -266,6 +269,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::PointCloud2::ConstPtr& msg){
   {
     pcl::PointCloud<hesai_ros::Point> pl_orig;
     pcl::fromROSMsg(*msg, pl_orig);
+    if (pl_orig.empty()) return;
     lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
     const double time_begin = pl_orig.points[0].timestamp;
     lidar_data.start_time = time_begin;
@@ -311,7 +315,6 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::PointCloud2::ConstPtr& msg){
       lidar_data.pc->emplace_back(
           pt.x, pt.y, pt.z, pt.intensity, pt.time);
     }
-    lidar_data.end_time = lidar_data.start_time + lidar_data.pc->points.back().offset_time;
     break;
   }
   case OUSTER:
@@ -335,6 +338,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::PointCloud2::ConstPtr& msg){
     return;
   }
   
+  if (!finalizeLidarScan(lidar_data)) return;
   lidar_buffer_.push_back(lidar_data);
 }
 
@@ -349,6 +353,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
   data.gyr  = V3(msg->angular_velocity.x,
                  msg->angular_velocity.y,
                  msg->angular_velocity.z);
+  if (!std::isfinite(data.secs) || !data.acc.allFinite() || !data.gyr.allFinite()) return;
 
   if (data.secs < last_timestamp_imu_) {
     LOG(WARNING) << "imu loop back, clear buffer";
@@ -446,6 +451,11 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
     meas.imu.push_back(imu_buffer_.front());
     imu_buffer_.pop_front();
   }
+  // Retain the right bracket for the next scan, but use it now to integrate
+  // exactly to this scan's end instead of stopping at the last earlier IMU.
+  if (!imu_buffer_.empty() &&
+      (meas.imu.empty() || meas.imu.back().secs < meas.lidar.end_time))
+    meas.imu.push_back(imu_buffer_.front());
 
   last_timestamp_lidar_ = meas.lidar.end_time;
   lidar_buffer_.pop_front();

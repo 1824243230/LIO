@@ -28,6 +28,10 @@ class Harness : public SuperLIO {
     geometry_options_.enable_informed_sampling=enhanced;
     if(enhanced) bump_map_=std::make_unique<geometry::BumpMap>(geometry_options_,0.5);
     DownSample();
+    if (enhanced) {
+      check(ds_undistort_==original_sample_ && !sampling_geometry_analyzed_,
+            "unsupported surface skips fine sampling and defers frame analysis");
+    }
   }
   void emulate_changed_sampling() {
     ds_undistort_.reset(new PointCloudType(*scan_undistort_full_));
@@ -35,7 +39,7 @@ class Harness : public SuperLIO {
   }
   void remove_map() { bump_map_.reset(); }
   void fail_analysis() { geometry_options_.rotation_length_scale=std::numeric_limits<double>::quiet_NaN(); }
-  void run() { Observe(); }
+  void run() { ++frame_num_; Observe(); }
   auto state() const { return kf_->GetSysState(); }
   auto covariance() const { return kf_->GetCov(); }
   const auto& points() const { return *ds_undistort_; }

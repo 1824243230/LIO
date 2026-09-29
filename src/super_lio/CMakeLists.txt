@@ -99,6 +99,9 @@ target_link_libraries(relocation_node
 )
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(lio_numerics_test tests/lio_numerics_test.cpp)
+  target_link_libraries(lio_numerics_test lio)
+  add_test(NAME lio_numerics COMMAND lio_numerics_test)
   add_executable(geometry_test tests/geometry_test.cpp src/lio/geometry.cpp)
   add_test(NAME geometry_core COMMAND geometry_test)
   add_executable(geometry_filter_test tests/geometry_filter_test.cpp)

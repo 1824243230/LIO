@@ -186,34 +186,41 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
 
 bool ESKF::Predict(const IMUData& imu) {
 
+  if (!std::isfinite(imu.secs) || !imu.acc.allFinite() || !imu.gyr.allFinite()) return false;
+
   if(last_imu_time_ < 0){
     last_imu_time_ = imu.secs;
     last_imu_ = imu;
+    current_time_ = imu.secs;
     return false;
   }
 
+  if (imu.secs <= last_imu_time_) return false;
   if(imu.secs <= last_obs_time_){
     last_imu_time_ = imu.secs;
     last_imu_ = imu;
     return false;
   }
   
-  current_time_ = imu.secs;
+  const double start = std::max(last_imu_time_, last_obs_time_);
+  const double end = std::min(imu.secs, current_obs_time_);
+  const double dt = end - start;
+  if (!std::isfinite(dt) || dt <= 0) return false;
+  const double span = imu.secs - last_imu_time_;
+  const scalar alpha_start = (start - last_imu_time_) / span;
+  const scalar alpha_end = (end - last_imu_time_) / span;
+  const V3 acc_start = last_imu_.acc + alpha_start * (imu.acc - last_imu_.acc);
+  const V3 gyr_start = last_imu_.gyr + alpha_start * (imu.gyr - last_imu_.gyr);
+  IMUData endpoint;
+  endpoint.secs = end;
+  endpoint.acc = last_imu_.acc + alpha_end * (imu.acc - last_imu_.acc);
+  endpoint.gyr = last_imu_.gyr + alpha_end * (imu.gyr - last_imu_.gyr);
+  current_time_ = end;
 
-  double dt;
-  if(last_imu_time_ < last_obs_time_){
-    dt = imu.secs - last_obs_time_;
-  }else if (imu.secs > current_obs_time_){
-    dt = current_obs_time_ - last_imu_time_;
-    current_time_ = current_obs_time_;
-  }else{
-    dt = imu.secs - last_imu_time_;
-  }
-
-  V3 acc = 0.5 * (imu.acc + last_imu_.acc);
+  V3 acc = 0.5 * (endpoint.acc + acc_start);
   acc = imu_scale_ * acc;
   acc = acc - ba_;
-  body_omega_ = 0.5 * (imu.gyr + last_imu_.gyr) - bg_;
+  body_omega_ = 0.5 * (endpoint.gyr + gyr_start) - bg_;
   M3 Jr_dt = (dt * RightJacobianSO3(body_omega_, dt)).cast<scalar>();   // J_l(-phi) = J_r(phi)
 
   M3 R_m3 = R_.R_;
@@ -241,14 +248,17 @@ bool ESKF::Predict(const IMUData& imu) {
   v_ = v_ + global_acc_ * dt;
   R_ = R_ * SO3::Exp(body_omega_, dt);
 
-  last_imu_time_ = imu.secs;
-  last_imu_ = imu;
+  last_imu_time_ = end;
+  last_imu_ = endpoint;
   return true;
 }
 
 
 const int STATE_DIM = 18;
 bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> correction_guard) {
+  const ESKF prior = *this;
+  const auto reject = [&]() { *this = prior; return false; };
+  if (options_.num_iterations_ <= 0 || !P_.allFinite()) return reject();
   // propagated state
   SO3 R_pred = R_;
   V3  p_pred = p_;
@@ -274,6 +284,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
     }
 
     obs(GetKFState(), HTVH, HTVr);
+    if (!HTVH.allFinite() || !HTVr.allFinite() || HTVH.isZero()) return reject();
 
     V18 dx_prior = V18::Zero();
     dx_prior.template block<3,1>(0,0)  = (R_pred.inverse() * R_).log_vee();
@@ -299,8 +310,18 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
     HTRH.template block<6,6>(0,0) = HTVH;
 
     // information form
-    M18 A = Pk.inverse() + HTRH;
-    Qk = A.inverse();
+    // Factor in double precision: weak LiDAR modes must retain the IMU prior.
+    using D18 = Eigen::Matrix<double, 18, 18>;
+    const D18 covariance = (0.5 * (Pk + Pk.transpose())).cast<double>();
+    Eigen::LLT<D18> prior_factor(covariance);
+    if (prior_factor.info() != Eigen::Success) return reject();
+    const D18 information = prior_factor.solve(D18::Identity()) +
+        (0.5 * (HTRH + HTRH.transpose())).cast<double>();
+    Eigen::LLT<D18> information_factor(information);
+    if (information_factor.info() != Eigen::Success) return reject();
+    const D18 posterior = information_factor.solve(D18::Identity());
+    if (!posterior.allFinite()) return reject();
+    Qk = posterior.cast<scalar>();
 
     V18 b = V18::Zero();
     b.template head<6>() = HTVr;
@@ -310,8 +331,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
     // dx = K_h + (K_x - I) * dx_prior
     dx_ = Qk * b + (K_x - M18::Identity()) * dx_prior;
 
-    if (correction_guard && !correction_guard(dx_)) return false;
+    if (!dx_.allFinite() || (correction_guard && !correction_guard(dx_))) return reject();
     Update();
+    if (!R_.R_.allFinite() || !p_.allFinite() || !v_.allFinite() ||
+        !bg_.allFinite() || !ba_.allFinite() || !g_.allFinite()) return reject();
 
     if (dx_.lpNorm<Eigen::Infinity>() < options_.quit_eps_ && iter > 0) {
       break;
@@ -328,7 +351,8 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
 
   P_ = G_reset * P_ * G_reset.transpose();
 
-  P_ = 0.5 * (P_ + P_.transpose());
+  P_ = (0.5 * (P_ + P_.transpose())).eval();
+  if (!P_.allFinite() || Eigen::LLT<M18>(P_).info() != Eigen::Success) return reject();
 
   dx_.setZero();
 

@@ -64,8 +64,27 @@ void SuperLIO::DownSample() {
   voxel_grid_fliter_.setInputCloud(scan_undistort_full_);
   voxel_grid_fliter_.filter(ds_undistort_);
   original_sample_ = ds_undistort_;
-  AnalyzeSamplingGeometry();
+  sampling_geometry_analyzed_ = false;
   const auto pose = kf_->GetSE3();
+  // Fine sampling selects original points. If none of the full scan can query
+  // a supported historical surface at the prior pose, retain the baseline
+  // sample and avoid an extra KNN pass, fine/coarse resampling and replay.
+  // Observe still analyzes geometry and attempts measurements at each iterate.
+  // Sampling-only ablations deliberately retain their existing behavior.
+  if (geometry_options_.enable_informed_sampling && geometry_options_.enable_bump_measurement) {
+    bool supported_surface = false;
+    if (bump_map_) for (const auto& p : *scan_undistort_full_) {
+      const BASIC::V3 body(p.x,p.y,p.z);
+      if (!body.allFinite()) continue;
+      geometry::Surface surface;
+      if (bump_map_->query((pose*body).cast<double>(), surface)) {
+        supported_surface = true;
+        break;
+      }
+    }
+    if (!supported_surface) return;
+  }
+  AnalyzeSamplingGeometry();
   geometry::informedSample(scan_undistort_full_, pose.R_.cast<double>(), pose.t_.cast<double>(),
                            bump_map_.get(), degeneracy_, geometry_options_, ds_undistort_);
 }

@@ -1,3 +1,4 @@
+#include "lio/plane_fit.h"
 
 #include "lio/super_lio_reloc.h"
 
@@ -15,47 +16,6 @@
 using namespace BASIC;
 
 namespace LI2Sup{
-
-inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
-{
-  Eigen::Vector3d normvec;
-  if (N == 5) {
-    Eigen::Matrix<double, 5, 3> A;
-    Eigen::Matrix<double, 5, 1> b;
-    for (int j = 0; j < 5; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-  else {
-    Eigen::Matrix<double, 4, 3> A;
-    Eigen::Matrix<double, 4, 1> b;
-
-    for (int j = 0; j < N; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-
-  double n = normvec.norm();
-  if (n < 1e-6f) return false;
-
-  abcd[3] = 1.0 / n;
-  normvec *= abcd[3];
-  abcd[0] = normvec[0];
-  abcd[1] = normvec[1];
-  abcd[2] = normvec[2];
-  
-  for (int i = 0; i < N; ++i) {
-    const V3& p = points[i];
-    auto dist = abcd[0] * p(0) + abcd[1] * p(1) + abcd[2] * p(2) + abcd[3];
-    if (std::abs(dist) > 0.1) return false;
-  }
-  return true;
-}
-
 
 inline bool compute_error(
   const std::array<double, 4>& abcd, const V3& point, 

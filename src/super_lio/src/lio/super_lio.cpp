@@ -1,3 +1,5 @@
+#include "lio/plane_fit.h"
+#include "lio/deskew.h"
 
 #include "lio/super_lio.h"
 
@@ -11,47 +13,6 @@
 using namespace BASIC;
 
 namespace LI2Sup{
-
-inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
-{
-  Eigen::Vector3d normvec;
-  if (N == 5) {
-    Eigen::Matrix<double, 5, 3> A;
-    Eigen::Matrix<double, 5, 1> b;
-    for (int j = 0; j < 5; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-  else {
-    Eigen::Matrix<double, 4, 3> A;
-    Eigen::Matrix<double, 4, 1> b;
-
-    for (int j = 0; j < N; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-
-  double n = normvec.norm();
-  if (n < 1e-6f) return false;
-
-  abcd[3] = 1.0 / n;
-  normvec *= abcd[3];
-  abcd[0] = normvec[0];
-  abcd[1] = normvec[1];
-  abcd[2] = normvec[2];
-  
-  for (int i = 0; i < N; ++i) {
-    const V3& p = points[i];
-    auto dist = abcd[0] * p(0) + abcd[1] * p(1) + abcd[2] * p(2) + abcd[3];
-    if (std::abs(dist) > 0.1) return false;
-  }
-  return true;
-}
-
 
 inline bool compute_error(
   const std::array<double, 4>& abcd, const V3& point, 
@@ -202,16 +163,16 @@ void SuperLIO::stateProcess(){
     time_record_.Evaluate([this](){Propagation_Undistort();}, "Undistort");
     time_record_.Evaluate([this]() { DownSample(); }, "DownSample");
     time_record_.Evaluate([this]() { Observe(); }, "Observe");
-    time_record_.Evaluate([this]() { UpdateMap(); }, "UpdateMap");
+    if (observation_valid_) time_record_.Evaluate([this]() { UpdateMap(); }, "UpdateMap");
   }else{
     Propagation_Undistort();
     DownSample();
     Observe();
-    UpdateMap();
+    if (observation_valid_) UpdateMap();
   }
   PublishGeometry();
   Output();
-  caceData();
+  if (observation_valid_) caceData();
 }
 
 
@@ -388,15 +349,12 @@ void SuperLIO::Propagation_Undistort(){
   propagate_states_.emplace_back(kf_->GetDynamicState());
   kf_->SetObsTime(measures_.lidar.end_time);
   for (auto &imu : measures_.imu) {
-    kf_->Predict(imu);
-    propagate_states_.emplace_back(kf_->GetDynamicState());
+    if (kf_->Predict(imu) && kf_->GetTime() > propagate_states_.back().time)
+      propagate_states_.emplace_back(kf_->GetDynamicState());
   }
 
-  static const M3 TLI_R = g_lidar_imu.R_;
-  static const V3 TLI_t = g_lidar_imu.t_;
-  const SE3 T_end = kf_->GetSE3();
-  const M3  R_inv = T_end.R_.transpose();
-  const V3  T_end_t = T_end.t_;
+  const M3 TLI_R = g_lidar_imu.R_;
+  const V3 TLI_t = g_lidar_imu.t_;
   const double start_time = measures_.lidar.start_time;
   auto& raw_pc = measures_.lidar.pc;
 
@@ -406,43 +364,13 @@ void SuperLIO::Propagation_Undistort(){
   tbb::parallel_for(
   tbb::blocked_range<size_t>(0, ptsize),
   [&](const tbb::blocked_range<size_t>& r) {
-    M3 R_h, R_t; V3 p_h, v_h, acc_t, w_t;
     for (size_t idx = r.begin(); idx < r.end(); ++idx) {  
       auto& pt_full = scan_undistort_full_->points[idx];
       const auto& pt = raw_pc->points[idx];
       pt_full.intensity = pt.intensity;
-      double query_time = start_time + pt.offset_time;
-      if (query_time > propagate_states_.back().time) {
-        V3 raw(pt.x, pt.y, pt.z);
-        V3 eigen_point = TLI_R * raw + TLI_t;
-        pt_full.x = eigen_point[0];
-        pt_full.y = eigen_point[1];
-        pt_full.z = eigen_point[2];
-        continue;
-      }
-      auto match_iter = propagate_states_.begin();
-      for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
-        auto next_iter = std::next(iter);
-        if (iter->time < query_time && next_iter->time >= query_time) {
-          match_iter = iter;
-          break;
-        }
-      }
-      auto match_iter_n = std::next(match_iter);
-      double dt = match_iter_n->time - match_iter->time;
-      double tau = query_time - match_iter->time;
-      double s   = tau / dt;
-      R_h = match_iter->R;
-      R_t = match_iter_n->R;
-      p_h = match_iter->p;
-      v_h = match_iter->v;
-      acc_t = match_iter_n->a;
-      w_t = match_iter_n->w;
-      M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
-      V3 p_i = p_h + v_h * tau + 0.5 * acc_t * tau * tau;
-      V3 t_ei = p_i - T_end_t;
-      V3 raw(pt.x, pt.y, pt.z);
-      V3 eigen_point = R_inv * (R_i * (TLI_R * raw + TLI_t) + t_ei);
+      const double query_time = start_time + pt.offset_time;
+      const V3 raw(pt.x, pt.y, pt.z);
+      const V3 eigen_point = deskewPoint(TLI_R * raw + TLI_t, query_time, propagate_states_);
       pt_full.x = eigen_point[0];
       pt_full.y = eigen_point[1];
       pt_full.z = eigen_point[2];
@@ -471,6 +399,7 @@ void SuperLIO::AnalyzeSamplingGeometry() {
     G += 1000 * J * J.transpose();
   }
   degeneracy_ = geometry_analyzer_.analyze(G, geometry_options_, true);
+  sampling_geometry_analyzed_ = true;
 }
 
 
@@ -482,6 +411,7 @@ struct ThreadACC{
 
 
 void SuperLIO::Observe(bool plane_only){
+  observation_valid_ = false;
   size_t ptsize = ds_undistort_->size();
   effect_mask_.assign(ptsize, 0);
   effect_knn_mask_.assign(ptsize, 0);
@@ -581,7 +511,7 @@ void SuperLIO::Observe(bool plane_only){
     if (geometry_options_.enable_degeneracy) {
       using Clock = std::chrono::steady_clock;
       const auto analysis_start = Clock::now();
-      degeneracy_ = geometry_analyzer_.analyze(sum_HTVH, geometry_options_, observation_calls == 0 && !geometry_options_.enable_informed_sampling && !plane_only);
+      degeneracy_ = geometry_analyzer_.analyze(sum_HTVH, geometry_options_, observation_calls == 0 && !sampling_geometry_analyzed_ && !plane_only);
       geometry_failed = geometry_failed || !degeneracy_.valid;
       if (geometry_failed) allow_bump = false;
       geometry_stats_ = geometry::Diagnostics{};
@@ -686,7 +616,8 @@ void SuperLIO::Observe(bool plane_only){
       (!degeneracy_.valid || degeneracy_.status != geometry::Status::NORMAL))
     geometry_stats_.fallback = true; // Already used original sampling and only plane rows.
 
-  frame_num_++;
+  observation_valid_ = update_ok;
+  if (!update_ok) ROS_WARN_THROTTLE(1.0, "LIO observation rejected; retaining IMU prior and skipping map insertion");
 }
 
 

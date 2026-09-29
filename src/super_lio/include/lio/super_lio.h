@@ -75,6 +75,8 @@ protected:
   BASIC::CloudPtr original_sample_; // Original center-based cloud retained for full frame rollback.
   BASIC::CloudPtr point_map_, world_pc_, ds_world_;
   int frame_num_ = 0;
+  bool observation_valid_ = true;
+  bool sampling_geometry_analyzed_ = false;
   BASIC::SE3 sys_init_pose_;
   BASIC::SE3 last_pose_;
 
@@ -99,5 +101,3 @@ protected:
 } // namespace END.
 
 #endif
-
-
