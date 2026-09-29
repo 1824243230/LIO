@@ -55,7 +55,7 @@ public:
   bool Predict(const IMUData& imu);
 
   using ObsFunc = std::function<void(const KFState& kf_state, BASIC::M6& HT_Vinv_H, BASIC::V6& HT_Vinv_r)>;
-  bool UpdateObserve(ObsFunc obs);
+  bool UpdateObserve(ObsFunc obs, std::function<bool(const STATE&)> correction_guard = {});
 
   double GetTime() const { return current_time_; }
 

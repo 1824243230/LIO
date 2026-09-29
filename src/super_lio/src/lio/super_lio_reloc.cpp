@@ -69,6 +69,7 @@ inline bool compute_error(
 void SuperLIOReLoc::init(){
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
   kf_.reset(new ESKF());
+  InitGeometry();
   data_wrapper_->setESKF(kf_);
   
   scan_undistort_full_.reset(new PointCloudType());
@@ -118,6 +119,11 @@ bool SuperLIOReLoc::map_init(){
   }
 
   ivox_->insert(point_map_v3);
+  if (bump_map_) {
+    std::vector<geometry::V3> points;
+    for (const auto& p : point_map_v3) points.push_back(p.cast<double>());
+    bump_map_->insert(points, geometry::V3::Zero());
+  }
 
   LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
@@ -297,6 +303,7 @@ void SuperLIOReLoc::UpdateMap() {
   }
   
   ivox_->insert(points_world_v3_);
+  UpdateBumpMap();
 
 }
 

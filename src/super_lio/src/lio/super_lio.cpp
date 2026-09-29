@@ -65,6 +65,7 @@ inline bool compute_error(
 void SuperLIO::init(){
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
   kf_.reset(new ESKF());
+  InitGeometry();
   data_wrapper_->setESKF(kf_);
   
   scan_undistort_full_.reset(new PointCloudType());
@@ -180,6 +181,11 @@ bool SuperLIO::map_init(){
   );
 
   ivox_->insert(points_world_v3_);
+  if (bump_map_) {
+    std::vector<geometry::V3> points;
+    for (const auto& p : points_world_v3_) points.push_back(p.cast<double>());
+    bump_map_->insert(points, transform.t_.cast<double>());
+  }
   kf_->SetLastObsTime(measures_.lidar.end_time);
 
   if(frame_num_ > 3){
@@ -203,6 +209,7 @@ void SuperLIO::stateProcess(){
     Observe();
     UpdateMap();
   }
+  PublishGeometry();
   Output();
   caceData();
 }
@@ -265,7 +272,15 @@ void SuperLIO::ProcessCaceMap(){
   PointCloudType::Ptr merged_map(new PointCloudType());
 
   int count = 0;
-  for (const auto& entry : fs::directory_iterator(pcd_folder)) {
+  std::error_code directory_error;
+  fs::directory_iterator fragment_it(pcd_folder, directory_error), end;
+  if (directory_error) {
+    LOG(WARNING) << "Cannot read PCD directory: " << directory_error.message();
+    return;
+  }
+  for (; fragment_it != end; fragment_it.increment(directory_error)) {
+    if (directory_error) break;
+    const auto& entry = *fragment_it;
     if (entry.path().extension() == ".pcd" &&
       entry.path().filename().string().find("scans_") != std::string::npos) {
       PointCloudType::Ptr tmp_cloud(new PointCloudType());
@@ -280,6 +295,14 @@ void SuperLIO::ProcessCaceMap(){
     }
   }
 
+  if (directory_error) {
+    LOG(ERROR) << "Cannot iterate PCD directory: " << directory_error.message();
+    return;
+  }
+  if (merged_map->empty()) {
+    LOG(WARNING) << "No points in PCD fragments; skipping map save.";
+    return;
+  }
   LOG(INFO) << YELLOW << " ---> Total merged fragments: " << count << RESET;
 
   PointCloudType filtered_map;
@@ -311,6 +334,18 @@ void SuperLIO::ProcessCaceMap(){
 
 void SuperLIO::saveMap(){
   if(!g_save_map) return;
+  if (!point_map_ || (point_map_->empty() && pcd_index_ < 0)) {
+    LOG(INFO) << "No map data collected; skipping map save.";
+    return;
+  }
+  std::error_code directory_error;
+  std::filesystem::create_directories(
+      g_pcd_save_interval > 0 ? g_save_map_dir + "/PCD" : g_save_map_dir,
+      directory_error);
+  if (directory_error) {
+    LOG(ERROR) << "Cannot create map directory: " << directory_error.message();
+    return;
+  }
   if(g_pcd_save_interval > 0){
     LOG(INFO) << YELLOW << " ---> Saving last cace ... " << RESET;
     if (point_map_->size() > 0) {
@@ -416,9 +451,26 @@ void SuperLIO::Propagation_Undistort(){
 }
 
 
-void SuperLIO::DownSample(){
-  voxel_grid_fliter_.setInputCloud(scan_undistort_full_);
-  voxel_grid_fliter_.filter(ds_undistort_);
+
+void SuperLIO::AnalyzeSamplingGeometry() {
+  if (!geometry_options_.enable_degeneracy || !geometry_options_.enable_informed_sampling) return;
+  geometry::M6 G = geometry::M6::Zero();
+  const auto pose = kf_->GetSE3();
+  KNNHeapType neighbors;
+  ivox_->reset_max_group();
+  for (const auto& p : *ds_undistort_) {
+    const V3 body(p.x,p.y,p.z), world = pose*body;
+    if (!world.allFinite()) continue;
+    neighbors.reset(); ivox_->getTopK(world, neighbors);
+    std::array<double,4> plane;
+    scalar residual;
+    if (neighbors.count < 4 || !calc_plane_coeff(neighbors.count, neighbors.points_, plane) ||
+        !compute_error(plane, world, body.norm(), residual)) continue;
+    const auto J = geometry::poseJacobian(body.cast<double>(), pose.R_.cast<double>(),
+                                          geometry::V3(plane[0],plane[1],plane[2]));
+    G += 1000 * J * J.transpose();
+  }
+  degeneracy_ = geometry_analyzer_.analyze(G, geometry_options_, true);
 }
 
 
@@ -429,9 +481,25 @@ struct ThreadACC{
 };
 
 
-void SuperLIO::Observe(){
+void SuperLIO::Observe(bool plane_only){
   size_t ptsize = ds_undistort_->size();
-  
+  effect_mask_.assign(ptsize, 0);
+  effect_knn_mask_.assign(ptsize, 0);
+  effect_knn_idxs_.resize(ptsize);
+  abcd_vec_.resize(ptsize);
+  geometry_stats_ = geometry::Diagnostics{};
+  std::vector<geometry::V6> plane_J;
+  std::vector<double> plane_error;
+  if (geometry_options_.enable_degeneracy) {
+    plane_J.resize(ptsize, geometry::V6::Zero());
+    plane_error.resize(ptsize, 0);
+  }
+  const ESKF prior = *kf_; // includes covariance, gravity, bias and forward propagation state
+  const auto prior_pose = kf_->GetSE3();
+  bool allow_bump = !plane_only && geometry_options_.enable_bump_measurement && bool(bump_map_);
+  bool used_bump = false;
+  bool geometry_failed = false; // A failed analysis disables bump for the rest of this frame.
+  int observation_calls = 0;
   static std::vector<float> _lengths;
   points_body_v3_.resize(ptsize);
   _lengths.resize(ptsize);
@@ -448,7 +516,7 @@ void SuperLIO::Observe(){
   ivox_->reset_max_group();
   int iter_num = 0;
 
-  kf_->UpdateObserve([&, this](const ESKF::KFState &kf_state, M6 &HTVH, V6 &HTVr) {
+  auto observation = [&, this](const ESKF::KFState &kf_state, M6 &HTVH, V6 &HTVr) {
     const SE3 pose = kf_state.pose;
     const bool need_converge = kf_state.need_converge;
     const M3d R_transpose = (pose.R_.transpose()).cast<double>();
@@ -492,6 +560,12 @@ void SuperLIO::Observe(){
             J.head<3>() = point_body_d.cross(nb);
             J.tail<3>() = normvec;
       
+            if (geometry_options_.enable_degeneracy) {
+              plane_J[idx] = J;
+              plane_error[idx] = error;
+            }
+            // Plane reliability is handled by the original correspondence/residual gates.
+            // Keep Rp=0.001 in every geometry state; only selected bump rows get their own Rb.
             local_acc.HTVH += J * 1000 * J.transpose();
             local_acc.HTVr -= J * 1000 * error;
           }
@@ -504,6 +578,56 @@ void SuperLIO::Observe(){
       sum_HTVH += local_acc.HTVH;
       sum_HTVr += local_acc.HTVr;
     }
+    if (geometry_options_.enable_degeneracy) {
+      using Clock = std::chrono::steady_clock;
+      const auto analysis_start = Clock::now();
+      degeneracy_ = geometry_analyzer_.analyze(sum_HTVH, geometry_options_, observation_calls == 0 && !geometry_options_.enable_informed_sampling && !plane_only);
+      geometry_failed = geometry_failed || !degeneracy_.valid;
+      if (geometry_failed) allow_bump = false;
+      geometry_stats_ = geometry::Diagnostics{};
+      geometry_stats_.analysis_ms = std::chrono::duration<double, std::milli>(Clock::now()-analysis_start).count();
+      const auto bump_start = Clock::now();
+      std::vector<geometry::Candidate> candidates;
+      double plane_squared = 0;
+      for (size_t i = 0; i < ptsize; ++i) {
+        if (!effect_mask_[i]) continue;
+        ++geometry_stats_.planes;
+        plane_squared += plane_error[i]*plane_error[i];
+        if (!allow_bump || !degeneracy_.valid || degeneracy_.status == geometry::Status::NORMAL) continue;
+        geometry::Surface surface;
+        if (!bump_map_->query((pose*points_body_v3_[i]).cast<double>(), surface)) {
+          ++geometry_stats_.rejected_map; continue;
+        }
+        geometry::Candidate c; c.index = i;
+        if (geometry::candidate(surface, points_body_v3_[i].cast<double>(), pose.R_.cast<double>(),
+                                degeneracy_, geometry_options_, c, geometry_stats_)) candidates.push_back(c);
+      }
+      geometry::selectWeakDirectionConstraints(candidates, degeneracy_, geometry_options_);
+      // Strategy A: only final accepted indices replace their own plane rows.
+      geometry::applyExclusiveBumps(plane_J, plane_error, effect_mask_, candidates, sum_HTVH, sum_HTVr);
+      double bump_squared = 0;
+      for (const auto& c : candidates) {
+        plane_squared -= plane_error[c.index]*plane_error[c.index];
+        bump_squared += c.residual*c.residual;
+        geometry_stats_.avg_mid += c.mid;
+        geometry_stats_.avg_gradient += c.gradient;
+        geometry_stats_.avg_weak += c.weak_score;
+        geometry_stats_.avg_covariance += c.variance;
+      }
+      geometry_stats_.accepted = candidates.size();
+      geometry_stats_.planes -= candidates.size();
+      if (!candidates.empty()) {
+        used_bump = true;
+        geometry_stats_.avg_mid /= candidates.size();
+        geometry_stats_.avg_gradient /= candidates.size();
+        geometry_stats_.avg_weak /= candidates.size();
+        geometry_stats_.avg_covariance /= candidates.size();
+        geometry_stats_.bump_rms = std::sqrt(bump_squared/candidates.size());
+      }
+      geometry_stats_.plane_rms = std::sqrt(std::max(0.0, plane_squared)/std::max(1, geometry_stats_.planes));
+      geometry_stats_.bump_ms = std::chrono::duration<double, std::milli>(Clock::now()-bump_start).count();
+    }
+    ++observation_calls;
     HTVH = sum_HTVH.cast<scalar>();
     HTVr = sum_HTVr.cast<scalar>();
 
@@ -521,7 +645,46 @@ void SuperLIO::Observe(){
     effect_knn_num_ = _effect_knn_num;
 
     iter_num++;
+  };
+  const bool update_ok = kf_->UpdateObserve(observation, [&](const ESKF::STATE& dx) {
+    return !used_bump || (dx.allFinite() &&
+      dx.head<3>().norm() <= geometry_options_.bump_max_rotation_correction &&
+      dx.segment<3>(3).norm() <= geometry_options_.bump_max_translation_correction);
   });
+  bool abnormal = false;
+  if (used_bump) {
+    const auto pose = kf_->GetSE3();
+    const double translation = (pose.t_-prior_pose.t_).norm();
+    const double rotation = SO3(prior_pose.R_.transpose()*pose.R_).log_vee().norm();
+    abnormal = !update_ok || !std::isfinite(translation) || !std::isfinite(rotation) || !kf_->GetCov().allFinite() ||
+      translation > geometry_options_.bump_max_translation_correction ||
+      rotation > geometry_options_.bump_max_rotation_correction;
+  }
+  const bool changed_sampling = original_sample_ && ds_undistort_ != original_sample_;
+  const bool no_final_bump = geometry_stats_.accepted == 0;
+  if (!plane_only && geometry_options_.enable_bump_measurement &&
+      (abnormal || (no_final_bump && (changed_sampling || used_bump)))) {
+    const auto attempted = geometry_stats_;
+    *kf_ = prior;
+    if (original_sample_) ds_undistort_ = original_sample_;
+    // Rebuild points, masks, correspondences and all iterations from the original prior/sample.
+    // plane_only prevents recursion and does not advance frame hysteresis a second time.
+    Observe(true);
+    geometry_stats_.candidates = attempted.candidates;
+    geometry_stats_.rejected_map = attempted.rejected_map;
+    geometry_stats_.rejected_mid = attempted.rejected_mid;
+    geometry_stats_.rejected_gradient = attempted.rejected_gradient;
+    geometry_stats_.rejected_pixel = attempted.rejected_pixel;
+    geometry_stats_.rejected_weak = attempted.rejected_weak;
+    geometry_stats_.rejected_residual = attempted.rejected_residual;
+    geometry_stats_.bump_ms += attempted.bump_ms;
+    geometry_stats_.analysis_ms += attempted.analysis_ms;
+    geometry_stats_.fallback = true;
+    return;
+  }
+  if (!plane_only && geometry_options_.enable_bump_measurement && no_final_bump &&
+      (!degeneracy_.valid || degeneracy_.status != geometry::Status::NORMAL))
+    geometry_stats_.fallback = true; // Already used original sampling and only plane rows.
 
   frame_num_++;
 }
@@ -543,6 +706,7 @@ void SuperLIO::UpdateMap() {
   }
   
   ivox_->insert(points_world_v3_);
+  UpdateBumpMap();
 
 }
 

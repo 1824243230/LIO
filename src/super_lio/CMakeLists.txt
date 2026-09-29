@@ -97,3 +97,20 @@ target_link_libraries(relocation_node
   lio
   ${catkin_LIBRARIES}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(geometry_test tests/geometry_test.cpp src/lio/geometry.cpp)
+  add_test(NAME geometry_core COMMAND geometry_test)
+  add_executable(geometry_filter_test tests/geometry_filter_test.cpp)
+  target_link_libraries(geometry_filter_test lio)
+  add_test(NAME geometry_filter COMMAND geometry_filter_test)
+  add_executable(geometry_map_test tests/geometry_map_test.cpp)
+  target_link_libraries(geometry_map_test lio)
+  add_test(NAME geometry_map COMMAND geometry_map_test)
+  add_executable(geometry_sampling_test tests/geometry_sampling_test.cpp)
+  target_link_libraries(geometry_sampling_test lio)
+  add_test(NAME geometry_sampling COMMAND geometry_sampling_test)
+  add_executable(geometry_fallback_test tests/geometry_fallback_test.cpp)
+  target_link_libraries(geometry_fallback_test lio)
+  add_test(NAME geometry_fallback COMMAND geometry_fallback_test)
+endif()

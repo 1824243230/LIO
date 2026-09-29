@@ -1,0 +1,19 @@
+<launch>
+  <!-- Phase 6: weak-direction selection, severity-aware trust and full original-frame fallback. -->
+  <arg name="rviz" default="true"/>
+  <arg name="csv_path" default=""/>
+  <include file="$(find super_lio)/launch/Livox_mid360.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+  </include>
+  <rosparam file="$(find super_lio)/config/geometry.yaml" command="load"/>
+  <param name="/lio/geometry/enable_degeneracy" value="true"/>
+  <param name="/lio/geometry/enable_bump_layer" value="true"/>
+  <param name="/lio/geometry/enable_informed_sampling" value="true"/>
+  <param name="/lio/geometry/enable_bump_measurement" value="true"/>
+  <param name="/lio/geometry/enable_weak_selection" value="true"/>
+  <param name="/lio/geometry/enable_adaptive_covariance" value="true"/>
+  <!-- Stronger reliable activation through covariance, never by increasing the point cap. -->
+  <param name="/lio/geometry/bump_degenerate_variance_factor" value="0.5"/>
+  <param name="/lio/geometry/rotation_length_scale" value="1.0"/>
+  <param name="/lio/geometry/csv_path" value="$(arg csv_path)"/>
+</launch>

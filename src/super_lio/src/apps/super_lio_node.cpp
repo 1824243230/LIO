@@ -1,5 +1,6 @@
 
 #include <csignal>
+#include <glog/logging.h>
 #include <ros/ros.h>
 #include "lio/super_lio.h"
 #include "ros/ROSWrapper.h"
@@ -12,6 +13,8 @@ void SigHandle(int sig) {
 }
 
 int main(int argc, char** argv){
+  google::InitGoogleLogging(argv[0]);
+  FLAGS_logtostderr = true;
   ros::init(argc, argv, "lio");
   signal(SIGINT, SigHandle);
   ros::NodeHandle nh;
@@ -31,5 +34,6 @@ int main(int argc, char** argv){
 
   lio->saveMap();
   lio->printTimeRecord();
+  google::ShutdownGoogleLogging();
   return 0;
 }

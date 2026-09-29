@@ -1,0 +1,48 @@
+# Optional overlay: rosparam load this file before starting the node.
+# Defaults preserve the original estimator; enable features explicitly.
+lio:
+  geometry:
+    enable_degeneracy: false
+    enable_bump_layer: false
+    enable_informed_sampling: false
+    enable_bump_measurement: false
+    enable_weak_selection: true
+    enable_adaptive_covariance: true
+    degeneracy_ratio_enter_weak: 0.01
+    degeneracy_ratio_enter_degenerate: 0.001
+    degeneracy_ratio_exit_weak: 0.02
+    degeneracy_ratio_exit_degenerate: 0.003
+    degeneracy_eigen_ratio_threshold: 0.02
+    rotation_length_scale: 1.0
+    bump_capacity: 5000
+    bump_history_points: 512
+    bump_min_points: 30
+    bump_min_roughness: 0.002
+    bump_plane_ratio_max: 0.15
+    bump_resolution: 0.05
+    bump_plane_reproject_angle_deg: 5.0
+    bump_range_weight_max: 1.0
+    bump_range_epsilon: 0.1
+    fine_resolution: 0.1
+    coarse_resolution: 0.5
+    mid_threshold: 0.005
+    informed_top_k_voxels: 100
+    max_bump_constraints: 200
+    bump_min_mid: 0.003
+    bump_min_gradient: 0.03
+    bump_min_pixel_confidence: 0.1
+    bump_min_weak_score: 0.001
+    weak_direction_score_threshold: 0.001
+    bump_mid_scale: 0.02
+    bump_gradient_scale: 0.3
+    bump_pixel_scale: 2.0
+    bump_weak_scale: 0.1
+    bump_residual_max: 0.15
+    bump_huber_delta: 0.03
+    sigma_b_base: 0.03
+    sigma_b_min: 0.01
+    sigma_b_max: 0.3
+    bump_degenerate_variance_factor: 0.5
+    bump_max_translation_correction: 0.5
+    bump_max_rotation_correction: 0.15
+    csv_path: ""

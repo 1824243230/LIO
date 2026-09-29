@@ -18,6 +18,8 @@
 #include "common/timer.h"
 #include "params.h"
 #include "ESKF.h"
+#include "lio/geometry.h"
+#include <fstream>
 #include "OctVoxMap/OctVoxMap.hpp"
 #include "OctVoxMap/VoxelGridFilter.h"
 #include "ros/ROSWrapper.h"
@@ -45,7 +47,11 @@ protected:
   virtual bool map_init();
   void Propagation_Undistort();
   void DownSample();
-  void Observe();
+  void AnalyzeSamplingGeometry();
+  void Observe(bool plane_only = false);
+  void InitGeometry();
+  void UpdateBumpMap();
+  void PublishGeometry();
   virtual void UpdateMap();
   virtual void Output();
   void caceData();
@@ -66,6 +72,7 @@ protected:
   std::vector<DynamicState> propagate_states_;
   BASIC::CloudPtr scan_undistort_full_;
   BASIC::CloudPtr ds_undistort_;
+  BASIC::CloudPtr original_sample_; // Original center-based cloud retained for full frame rollback.
   BASIC::CloudPtr point_map_, world_pc_, ds_world_;
   int frame_num_ = 0;
   BASIC::SE3 sys_init_pose_;
@@ -73,13 +80,19 @@ protected:
 
   std::size_t effect_knn_num_ = 0;
   BASIC::VV3 points_world_v3_, points_body_v3_;
-  alignas(64) bool effect_mask_[20000] = {false};
-  alignas(64) bool effect_knn_mask_[20000] = {false};
+  std::vector<unsigned char> effect_mask_, effect_knn_mask_;
   std::vector<int> effect_knn_idxs_;
   std::vector<std::pair<BASIC::M6, BASIC::V6>> H_R_;
   std::vector<std::array<double, 4>> abcd_vec_;
   int pcd_index_ = -1;
 
+  geometry::Options geometry_options_;
+  geometry::Analyzer geometry_analyzer_;
+  geometry::DegeneracyResult degeneracy_;
+  geometry::Diagnostics geometry_stats_;
+  std::unique_ptr<geometry::BumpMap> bump_map_;
+  std::vector<ros::Publisher> geometry_publishers_;
+  std::ofstream geometry_csv_;
   Timer time_record_;
 };
 

@@ -1,0 +1,15 @@
+<launch>
+  <!-- Stage 2-3: prepare geometry map only. Explicit false values override stale ROS parameters. -->
+  <arg name="rviz" default="true"/>
+  <arg name="csv_path" default=""/>
+  <include file="$(find super_lio)/launch/Livox_mid360.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+  </include>
+  <rosparam file="$(find super_lio)/config/geometry.yaml" command="load"/>
+  <param name="/lio/geometry/enable_degeneracy" value="true"/>
+  <param name="/lio/geometry/enable_bump_layer" value="true"/>
+  <param name="/lio/geometry/enable_informed_sampling" value="false"/>
+  <param name="/lio/geometry/enable_bump_measurement" value="false"/>
+  <param name="/lio/geometry/rotation_length_scale" value="1.0"/>
+  <param name="/lio/geometry/csv_path" value="$(arg csv_path)"/>
+</launch>

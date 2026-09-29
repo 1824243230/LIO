@@ -248,7 +248,7 @@ bool ESKF::Predict(const IMUData& imu) {
 
 
 const int STATE_DIM = 18;
-bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
+bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> correction_guard) {
   // propagated state
   SO3 R_pred = R_;
   V3  p_pred = p_;
@@ -310,6 +310,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     // dx = K_h + (K_x - I) * dx_prior
     dx_ = Qk * b + (K_x - M18::Identity()) * dx_prior;
 
+    if (correction_guard && !correction_guard(dx_)) return false;
     Update();
 
     if (dx_.lpNorm<Eigen::Infinity>() < options_.quit_eps_ && iter > 0) {
