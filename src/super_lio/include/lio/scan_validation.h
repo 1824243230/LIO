@@ -19,6 +19,7 @@ inline bool finalizeLidarScan(LidarData& scan) {
   }
   // Some Velodyne bags stamp the scan at its end: negative point offsets
   // are valid. Rebase while preserving every point's absolute timestamp.
+  // 时间戳可位于扫描末端，负偏移不代表坏点；重置基准时保持绝对采样时间不变。
   scan.end_time = scan.start_time + last;
   scan.start_time += first;
   for (auto& point : points) point.offset_time -= first;

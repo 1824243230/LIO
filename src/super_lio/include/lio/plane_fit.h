@@ -14,6 +14,7 @@ inline bool calc_plane_coeff(int count, const std::array<BASIC::V3, 5>& points,
     center += points[i].cast<double>();
   }
   center /= count;
+  // 中心化后取最小特征值对应法向，可表示经过原点的平面，且减少大坐标相消。
   Eigen::Matrix3d scatter = Eigen::Matrix3d::Zero();
   for (int i = 0; i < count; ++i) {
     const Eigen::Vector3d delta = points[i].cast<double>() - center;
@@ -22,7 +23,7 @@ inline bool calc_plane_coeff(int count, const std::array<BASIC::V3, 5>& points,
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(scatter);
   if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite()) return false;
   const auto values = solver.eigenvalues();
-  // A line or a point has no identifiable plane normal.
+  // 至少需要两个独立的面内方向；共线/重合邻点不能提供唯一平面法向。
   if (values[1] <= std::max(1e-10, 1e-4 * values[2])) return false;
   const Eigen::Vector3d normal = solver.eigenvectors().col(0);
   const double offset = -normal.dot(center);

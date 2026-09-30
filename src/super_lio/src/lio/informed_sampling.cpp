@@ -18,6 +18,7 @@ SamplingResult informedSample(const BASIC::CloudPtr& input, const M3& R, const V
   filter.setInputCloud(finite);
   filter.filter(fine);
   auto worldPoint = [&](const BASIC::PointType& p) -> V3 { return R*V3(p.x,p.y,p.z)+t; };
+  // 仅对已有可靠高度图的区域排名；提高几何丰富区域的点密度，不生成虚拟点。
   std::map<Key,double> regions;
   bool map_available = false;
   for (const auto& p : *fine) {
@@ -52,6 +53,7 @@ SamplingResult informedSample(const BASIC::CloudPtr& input, const M3& R, const V
   *combined += *coarse;
   combined->header=input->header;
   combined->is_dense=true;
+  // 原始采样仍由调用者持有；只有成功形成新采样才替换输出。
   output.swap(combined);
   result.applied=true;
   result.selected_voxels=selected.size();

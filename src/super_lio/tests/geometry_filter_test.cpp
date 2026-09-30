@@ -139,5 +139,23 @@ int main() {
             "all-state posterior matches explicit measurement stack");
     }
   }
+  // Spectral reliability must change BOTH correction and posterior confidence.
+  ESKF spectral_filter, raw_filter;
+  geometry::Options spectral_options;
+  auto spectral_observe = [&](bool enabled, const ESKF::KFState& state, M6& H, V6& b) {
+    geometry::M6 A=geometry::M6::Identity()*1000;
+    A(3,3)=5;
+    geometry::V6 rhs=geometry::V6::Zero();
+    rhs[3]=5*(0.1-state.pose.t_[0]);
+    rhs[4]=1000*(0.02-state.pose.t_[1]);
+    geometry::Diagnostics stats;
+    if(enabled) check(geometry::applySpectralReliability(A,rhs,spectral_options,stats), "spectral system valid");
+    H=A.cast<scalar>(); b=rhs.cast<scalar>();
+  };
+  check(raw_filter.UpdateObserve([&](const ESKF::KFState& s,M6& A,V6& b) { spectral_observe(false,s,A,b); }), "raw update");
+  check(spectral_filter.UpdateObserve([&](const ESKF::KFState& s,M6& A,V6& b) { spectral_observe(true,s,A,b); }), "spectral update");
+  check(spectral_filter.GetSE3().t_[0] < raw_filter.GetSE3().t_[0], "weak correction reduced");
+  check(spectral_filter.GetCov()(3,3) > raw_filter.GetCov()(3,3), "weak posterior more conservative");
+  check(std::abs(spectral_filter.GetSE3().t_[1]-raw_filter.GetSE3().t_[1])<1e-6, "reliable correction preserved");
   std::cout << "filter tests passed: baseline equivalence, adaptive information, guarded rollback\n";
 }

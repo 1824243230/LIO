@@ -5,6 +5,10 @@
 
 #include <pcl/point_cloud.h>
 #include <Eigen/Core>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #include "tsl/robin_hood.h"
 
@@ -22,11 +26,21 @@ private:
   CloudPtr cloud_;
   float voxel_size_ = 0.5f;
   float inv_voxel_size_ = 2.0f;
-  robin_hood::unordered_flat_map<std::size_t, std::size_t> voxel_map_;
+  // 保存完整有符号坐标作为键。哈希碰撞由相等比较解决，不能把坐标
+  // 直接按 15 bit 拼接：负坐标和超过 32767 的坐标会覆盖相邻轴。
+  using Key = std::array<int,3>;
+  struct KeyHash {
+    size_t operator()(const Key& key) const {
+      size_t h = 0;
+      for (int x : key) h ^= std::hash<int>{}(x)+0x9e3779b9+(h<<6)+(h>>2);
+      return h;
+    }
+  };
+  robin_hood::unordered_flat_map<Key, std::size_t, KeyHash> voxel_map_;
 
   std::vector<Point, Eigen::aligned_allocator<Point>> points_;
-  std::vector<float> dist2_;
-  const Eigen::Vector3i offset_ = Eigen::Vector3i(1000, 1000, 1000);
+  std::vector<double> dist2_;
+
 
 public:
   VoxelGridClosest() {
@@ -36,6 +50,8 @@ public:
   }
 
   void setLeafSize(float lx) {
+    if (!std::isfinite(lx) || lx <= 0 || !std::isfinite(1.0f/lx))
+      throw std::invalid_argument("voxel size must be finite and positive");
     voxel_size_ = lx;
     inv_voxel_size_ = 1.0f / lx;
   }
@@ -49,16 +65,18 @@ public:
     dist2_.clear();
     points_.clear();
 
+    if (!output) output.reset(new PointCloud());
+    if (!cloud_) { output->clear(); return; }
     for (const auto& pt : cloud_->points) {
-      Eigen::Vector3f pf = pt.getVector3fMap();
-      Eigen::Vector3i idx = (pf * inv_voxel_size_).array().round().cast<int>();
-      Eigen::Vector3f center = voxel_size_ * idx.cast<float>();
-      float d2 = (pf - center).squaredNorm();
-
-      idx += offset_; // Avoid negative indices
-      const std::size_t key = ((std::size_t(idx[2])) << 30) | 
-                              ((std::size_t(idx[1])) << 15) | 
-                              ( std::size_t(idx[0]));
+      const Eigen::Vector3d pf = pt.getVector3fMap().template cast<double>();
+      if (!pf.allFinite()) continue;
+      const Eigen::Vector3d cell = (pf * double(inv_voxel_size_)).array().round();
+      // 转换为整型前检查范围，避免极端输入触发未定义行为。
+      if ((cell.array() < std::numeric_limits<int>::min()).any() ||
+          (cell.array() > std::numeric_limits<int>::max()).any()) continue;
+      const Key key{int(cell.x()), int(cell.y()), int(cell.z())};
+      const Eigen::Vector3d center = double(voxel_size_) * cell;
+      const double d2 = (pf-center).squaredNorm();
 
       auto it = voxel_map_.find(key);
       if (it == voxel_map_.end()) {

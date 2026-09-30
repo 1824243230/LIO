@@ -95,6 +95,8 @@ struct DynamicState
   BASIC::V3  v = BASIC::V3::Zero();
   BASIC::V3  w = BASIC::V3::Zero();
   BASIC::V3  a = BASIC::V3::Zero();
+  BASIC::V3 specific_force = BASIC::V3::Zero();
+  BASIC::V3 gravity = BASIC::V3::Zero();
 };
 
 

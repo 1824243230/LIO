@@ -24,6 +24,7 @@ public:
   struct Options {
     Options(){}
     int num_iterations_ = 3;
+    bool smooth_motion_ = false;
     double quit_eps_ = 1e-6;
 
     double gyro_var_ = 1e-5;
@@ -63,7 +64,13 @@ public:
 
   NavState GetNavState() const { return NavState(current_time_, R_, p_, v_); }
 
-  DynamicState GetDynamicState() const { return DynamicState(current_time_, R_.R_, p_, v_, body_omega_, global_acc_); }
+  DynamicState GetDynamicState() const {
+    DynamicState state(current_time_, R_.R_, p_, v_, body_omega_, global_acc_);
+    state.specific_force = specific_force_; state.gravity = g_;
+    return state;
+  }
+  COV GetTransition() const { return last_transition_; }
+  COV GetProcessNoise() const { return last_process_noise_; }
 
   KFState GetKFState() const { return KFState{need_converge_, GetSE3()}; }
 
@@ -74,9 +81,12 @@ public:
   BASIC::SE3 GetSE3() const { return BASIC::SE3(R_, p_); }
 
   void SetObsTime(const double obs_time) { current_obs_time_ = obs_time; }
+  // 观测时间只作记录，IMU 积分起点由状态的真实测量锚点决定。
   void SetLastObsTime(const double obs_time) { last_obs_time_ = obs_time; }
 
   void SetX(const SysState& x);
+  // 初始化必须同时给出状态时刻的真实 IMU，不能用默认零测量作积分左端点。
+  void SetX(const SysState& x, const IMUData& imu);
 
   void SetCov(const COV& cov){ P_ = cov; }
 
@@ -110,6 +120,9 @@ private:
   STATE dx_ = STATE::Zero();
 
   COV P_ = COV::Identity();
+  COV last_transition_ = COV::Identity();
+  COV last_process_noise_ = COV::Zero();
+  BASIC::V3 specific_force_ = BASIC::V3::Zero();
 
   NOISE Q_ = NOISE::Zero();
 

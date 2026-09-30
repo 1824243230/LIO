@@ -19,6 +19,8 @@
 #include "params.h"
 #include "ESKF.h"
 #include "lio/geometry.h"
+#include "lio/motion_uncertainty.h"
+#include "lio/imu_initialization.h"
 #include <fstream>
 #include "OctVoxMap/OctVoxMap.hpp"
 #include "OctVoxMap/VoxelGridFilter.h"
@@ -45,7 +47,7 @@ protected:
   void stateProcess();
   virtual bool kf_init();
   virtual bool map_init();
-  void Propagation_Undistort();
+  bool Propagation_Undistort();
   void DownSample();
   void AnalyzeSamplingGeometry();
   void Observe(bool plane_only = false);
@@ -56,6 +58,7 @@ protected:
   virtual void Output();
   void caceData();
   void ProcessCaceMap();
+  bool FlushMapFragment();
 
   using StateFn = void (SuperLIO::*)();
   using OctVoxMapType = OctVoxMap<BASIC::V3, BASIC::scalar>;
@@ -67,9 +70,13 @@ protected:
   ROSWrapper::Ptr data_wrapper_;
   MeasureGroup measures_;
   
+  ImuInitialization imu_initialization_;
   bool flg_init_ = false;
   bool flg_first_scan_ = true;
   std::vector<DynamicState> propagate_states_;
+  bool smooth_motion_ = false;
+  bool uncertainty_motion_ = false;
+  motion::PointCovariances motion_covariances_;
   BASIC::CloudPtr scan_undistort_full_;
   BASIC::CloudPtr ds_undistort_;
   BASIC::CloudPtr original_sample_; // Original center-based cloud retained for full frame rollback.
@@ -87,6 +94,9 @@ protected:
   std::vector<std::pair<BASIC::M6, BASIC::V6>> H_R_;
   std::vector<std::array<double, 4>> abcd_vec_;
   int pcd_index_ = -1;
+  int scans_since_flush_ = 0;
+  std::string fragment_directory_;
+  std::vector<std::string> fragment_paths_;
 
   geometry::Options geometry_options_;
   geometry::Analyzer geometry_analyzer_;

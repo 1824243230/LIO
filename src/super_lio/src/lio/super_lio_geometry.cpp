@@ -7,16 +7,22 @@
 
 namespace LI2Sup {
 namespace {
+// metrics、PublishGeometry 中 values 和 CSV 列必须维持相同顺序。
 const std::vector<std::string> metrics = {
   "degeneracy_ratio", "weak_dim", "degeneracy_status", "bump_candidate_count",
   "bump_accepted_count", "bump_avg_mid", "bump_avg_gradient", "bump_avg_weak_score",
   "bump_avg_covariance", "plane_measurement_count", "bump_update_time", "degeneracy_analysis_time",
   "plane_residual_rms", "bump_residual_rms", "bump_fallback", "rejected_by_map", "rejected_by_mid",
   "rejected_by_gradient", "rejected_by_pixel", "rejected_by_weak_score", "rejected_by_residual",
-  "candidate_bump_count", "accepted_bump_count", "weak_dimension_count", "average_weak_score", "average_bump_covariance"};
+  "candidate_bump_count", "accepted_bump_count", "weak_dimension_count", "average_weak_score", "average_bump_covariance",
+  "spectral_valid", "spectral_attenuated_modes", "spectral_min_gain"};
 }
 void SuperLIO::InitGeometry() {
   ros::NodeHandle nh;
+  nh.param("/lio/motion/smooth_propagation", smooth_motion_, false);
+  nh.param("/lio/motion/uncertainty_aware", uncertainty_motion_, false);
+  ROS_INFO_STREAM("Motion compensation: rotating-force propagation=" << smooth_motion_
+                  << ", joint pose uncertainty=" << uncertainty_motion_);
 #define GOPT(type, name, value) nh.param("/lio/geometry/" #name, geometry_options_.name, geometry_options_.name);
 #include "lio/geometry_options.def"
 #undef GOPT
@@ -63,6 +69,7 @@ void SuperLIO::UpdateBumpMap() {
 void SuperLIO::DownSample() {
   voxel_grid_fliter_.setInputCloud(scan_undistort_full_);
   voxel_grid_fliter_.filter(ds_undistort_);
+  // 保留原采样指针供整帧回退；增强采样通过换指针输出，不修改原点云。
   original_sample_ = ds_undistort_;
   sampling_geometry_analyzed_ = false;
   const auto pose = kf_->GetSE3();
@@ -90,6 +97,7 @@ void SuperLIO::DownSample() {
 }
 void SuperLIO::PublishGeometry() {
   if (geometry_publishers_.empty()) return;
+  // 指标来自最终一次观测构建；spectral_valid 不等价于整帧 ESKF 更新成功。
   const auto& s = geometry_stats_;
   const std::vector<double> values = {
     degeneracy_.ratio, double(degeneracy_.weak_dim), degeneracy_.valid ? double(int(degeneracy_.status)) : -1.0,
@@ -97,7 +105,8 @@ void SuperLIO::PublishGeometry() {
     double(s.planes), s.bump_ms, s.analysis_ms, s.plane_rms, s.bump_rms, double(s.fallback),
     double(s.rejected_map), double(s.rejected_mid), double(s.rejected_gradient), double(s.rejected_pixel),
     double(s.rejected_weak), double(s.rejected_residual), double(s.candidates), double(s.accepted),
-    double(degeneracy_.weak_dim), s.avg_weak, s.avg_covariance};
+    double(degeneracy_.weak_dim), s.avg_weak, s.avg_covariance,
+    double(s.spectral_valid), double(s.spectral_attenuated), s.spectral_min_gain};
   for (size_t i=0;i<values.size();++i) { std_msgs::Float64 m; m.data=values[i]; geometry_publishers_[i].publish(m); }
   std_msgs::Float64MultiArray vectors;
   vectors.layout.dim.resize(2);

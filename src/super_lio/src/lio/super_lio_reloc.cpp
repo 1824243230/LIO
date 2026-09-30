@@ -49,7 +49,8 @@ void SuperLIOReLoc::init(){
   LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized." << RESET;
 
   auto start_time = std::chrono::high_resolution_clock::now();
-  SuperLIOReLoc::map_init();
+  if (!SuperLIOReLoc::map_init())
+    throw std::runtime_error("Relocation requires a readable, nonempty map");
   auto end_time = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
   LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init success. Time: " << duration.count() << " ms." << RESET;
@@ -59,17 +60,23 @@ void SuperLIOReLoc::init(){
 
 
 bool SuperLIOReLoc::map_init(){
-  static bool pcd_loaded = false;
-  if(pcd_loaded) return true;
+  if (map_loaded_) return true;
 
   std::string map_name = g_save_map_dir + "/" + g_map_name;
-  if(pcl::io::loadPCDFile<PointType>(map_name, *point_map_) == -1){
-    LOG(ERROR) << RED << " ---> Load map failed. File: " << map_name << RESET;
+  try {
+    if (pcl::io::loadPCDFile<PointType>(map_name, *point_map_) < 0) return false;
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "Cannot load relocation map " << map_name << ": " << error.what();
     return false;
   }
+  // 文件头的 is_dense 可能不准确，逐点检查后再进入地图/配准器。
+  auto& points = point_map_->points;
+  points.erase(std::remove_if(points.begin(),points.end(),[](const PointType& p) {
+    return !p.getVector3fMap().allFinite();
+  }),points.end());
+  point_map_->width=points.size();point_map_->height=1;point_map_->is_dense=true;
+  if (point_map_->empty()) return false;
 
-  std::vector<int> useless_indices;
-  pcl::removeNaNFromPointCloud(*point_map_, *point_map_, useless_indices);
 
   VV3 point_map_v3;
   point_map_v3.reserve(point_map_->size());
@@ -89,7 +96,7 @@ bool SuperLIOReLoc::map_init(){
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
   ivox_->printInfo();
 
-  pcd_loaded = true;
+  map_loaded_ = true;
 
   data_wrapper_->set_global_map(point_map_);
   data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_);
@@ -99,19 +106,13 @@ bool SuperLIOReLoc::map_init(){
 
 
 bool SuperLIOReLoc::kf_init(){
+  if (measures_.imu.empty()) return false;
   const int need_init_frames = 10;
-  static int imu_cout = 0;
-  static int init_frame_count = 0;
-  static V3 mean_gyro = V3::Zero();
-  static V3 mean_acce = V3::Zero();
-  
   /// get init guess from ROS topic.
   if(flg_get_init_guess_){
-    imu_cout = 0;
-    init_frame_count = 0;
+    imu_initialization_ = ImuInitialization{};
+    init_frame_count_ = 0;
     init_obs_data_->clear();
-    mean_gyro = V3::Zero();
-    mean_acce = V3::Zero();
     flg_get_init_guess_ = false;
     return false;
   }
@@ -127,27 +128,28 @@ bool SuperLIOReLoc::kf_init(){
     point_cloud_pcl->points.push_back(point);
   }
 
-  if(init_frame_count < need_init_frames){
+  if(init_frame_count_ < need_init_frames){
     *init_obs_data_ += *point_cloud_pcl;
   }
-  init_frame_count++;
+  init_frame_count_++;
 
-  for(auto& imu: measures_.imu){
-    imu_cout ++;
-    mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
-    mean_acce += (imu.acc - mean_acce) / imu_cout;
-  }
+  for (const auto& imu : measures_.imu) imu_initialization_.add(imu);
+  const auto& mean_gyro = imu_initialization_.mean_gyro;
+  const auto& mean_acce = imu_initialization_.mean_acc;
 
-  if(imu_cout < 20){
+  if(imu_initialization_.count < 20){
     return false;
   }
 
-  if(init_frame_count < need_init_frames){
+  if(init_frame_count_ < need_init_frames){
     return false;
   }
 
   LOG(INFO) << YELLOW << " ---> INIT start... obs_data size: " << init_obs_data_->size() << " target size: " << point_map_->size() << RESET;
 
+  // 零加速度均值无法确定重力方向，继续等待数据，避免归一化产生 NaN。
+  if (!mean_acce.allFinite() || !mean_gyro.allFinite() || mean_acce.norm() < 1e-6 ||
+      !std::isfinite(g_gravity_norm) || g_gravity_norm <= 0) return false;
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
   V3 ref_gravity(0, 0, - g_gravity_norm);
   M3 init_rot = Quat::FromTwoVectors(gravity, ref_gravity).toRotationMatrix();
@@ -192,11 +194,9 @@ bool SuperLIOReLoc::kf_init(){
   // if (icp.hasConverged() == false)
   {
     /// reset init state.
-    imu_cout = 0;
-    init_frame_count = 0;
+    imu_initialization_ = ImuInitialization{};
+    init_frame_count_ = 0;
     init_obs_data_->clear();
-    mean_gyro = V3::Zero();
-    mean_acce = V3::Zero();
     LOG(INFO) << RED << " ---> Global ICP Converged Fail! FitnessScore: " << icp.getFitnessScore() << RESET;
     return false;
   } else{
@@ -207,6 +207,7 @@ bool SuperLIOReLoc::kf_init(){
   LOG(INFO) << GREEN << "\n" << init_guess_T << RESET;
 
   ESKF::Options options;
+  options.smooth_motion_ = smooth_motion_;
   options.gyro_var_ = g_imu_ng;
   options.acce_var_ = g_imu_na;
   options.bias_gyro_var_ = g_imu_nbg;
@@ -221,7 +222,7 @@ bool SuperLIOReLoc::kf_init(){
   state.R = SO3(init_guess_T.block<3, 3>(0, 0));
   state.p = init_guess_T.block<3, 1>(0, 3);
   state.timestamp = -1.0;
-  kf_->SetX(state);
+  kf_->SetX(state, measures_.imu.back());
   sys_init_pose_ = kf_->GetSE3();
 
   {
@@ -239,11 +240,10 @@ bool SuperLIOReLoc::kf_init(){
 void SuperLIOReLoc::UpdateMap() {
   if(!g_update_map) return;
 
-  static int __update_delay = 100;
-  if(__update_delay > 0){
-    __update_delay--;
+  if(map_update_delay_ > 0){
+    map_update_delay_--;
     std::cout << "\rUpdate map Delay: "
-            << 100 - __update_delay
+            << 100 - map_update_delay_
             << " %" << std::flush;
     return;
   }

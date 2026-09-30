@@ -75,21 +75,19 @@ void SuperLIO::process(){
 
 
 bool SuperLIO::kf_init(){
-  static int imu_cout = 0;
-  static V3 mean_gyro = V3::Zero();
-  static V3 mean_acce = V3::Zero();
-
-  for(auto& imu: measures_.imu){
-    imu_cout ++;
-    mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
-    mean_acce += (imu.acc - mean_acce) / imu_cout;
-  }
+  if (measures_.imu.empty()) return false;
+  for (const auto& imu : measures_.imu) imu_initialization_.add(imu);
+  const auto& mean_gyro = imu_initialization_.mean_gyro;
+  const auto& mean_acce = imu_initialization_.mean_acc;
 
   /// 100 Hz for 1 second.
-  if(imu_cout < 50){
+  if(imu_initialization_.count < 50){
     return false;
   }
 
+  // 零加速度均值无法确定重力方向，继续等待数据，避免归一化产生 NaN。
+  if (!mean_acce.allFinite() || !mean_gyro.allFinite() || mean_acce.norm() < 1e-6 ||
+      !std::isfinite(g_gravity_norm) || g_gravity_norm <= 0) return false;
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
   V3 ref_gravity(0, 0, - g_gravity_norm);
   M3 init_rot = Quat::FromTwoVectors(gravity, ref_gravity).toRotationMatrix();
@@ -103,6 +101,7 @@ bool SuperLIO::kf_init(){
   M3 rot = g_lidar_robo_yaw * R_yaw_inv * init_rot;  
 
   ESKF::Options options;
+  options.smooth_motion_ = smooth_motion_;
   options.gyro_var_ = g_imu_ng;
   options.acce_var_ = g_imu_na;
   options.bias_gyro_var_ = g_imu_nbg;
@@ -116,39 +115,25 @@ bool SuperLIO::kf_init(){
   state.R = SO3(rot);
   state.p = g_odom_robo.t_;        // By default, the robot frame is used as the reference origin.
   state.timestamp = measures_.imu.back().secs;
-  kf_->SetX(state);
+  kf_->SetX(state, measures_.imu.back());
   sys_init_pose_ = kf_->GetSE3();
   return true;
 }
 
 
 bool SuperLIO::map_init(){
-  frame_num_++;
-
-  std::size_t ptsize = measures_.lidar.pc->size();
-  points_world_v3_.resize(ptsize);
-
-  const SE3 transform = sys_init_pose_ * g_lidar_imu;
-
-  tbb::parallel_for(
-    tbb::blocked_range<size_t>(0, ptsize),
-    [&](const tbb::blocked_range<size_t>& r) {
-      for (size_t idx = r.begin(); idx < r.end(); ++idx) {
-        auto& point_pcl = measures_.lidar.pc->points[idx];
-        V3 point_body(point_pcl.x, point_pcl.y, point_pcl.z);
-        points_world_v3_[idx] = transform * point_body;
-      }
-    }
-  );
-
-  ivox_->insert(points_world_v3_);
-  if (bump_map_) {
-    std::vector<geometry::V3> points;
-    for (const auto& p : points_world_v3_) points.push_back(p.cast<double>());
-    bump_map_->insert(points, transform.t_.cast<double>());
+  // 初始化后的数帧也会运动。必须把状态和点云推进到各自扫描末端，
+  // 不能固定初始位姿拼图后仅改 last_obs_time，留下旧状态/新时间的组合。
+  if (!Propagation_Undistort()) return false;
+  const auto pose = kf_->GetSE3();
+  points_world_v3_.resize(scan_undistort_full_->size());
+  for (size_t i=0;i<scan_undistort_full_->size();++i) {
+    const auto& p = scan_undistort_full_->points[i];
+    points_world_v3_[i] = pose*V3(p.x,p.y,p.z);
   }
-  kf_->SetLastObsTime(measures_.lidar.end_time);
-
+  ivox_->insert(points_world_v3_);
+  UpdateBumpMap();
+  ++frame_num_;
   if(frame_num_ > 3){
     g_flg_map_init = false;
     return true;
@@ -157,15 +142,23 @@ bool SuperLIO::map_init(){
 }
 
 
+// 每帧：IMU传播/去畸变 → 采样 → 迭代观测 → 成功后入图。失败预测不得污染历史地图。
 void SuperLIO::stateProcess(){
-  frame_num_++;
+  observation_valid_ = false;
+  bool propagated = false;
+  if (g_time_eva)
+    time_record_.Evaluate([&](){ propagated = Propagation_Undistort(); }, "Undistort");
+  else
+    propagated = Propagation_Undistort();
+  // 未达到末端的状态不能配准本帧，也不能发布带有错误时刻的点云。
+  // 已成功积分的前缀仍保留，后续扫描可继续使用有效 IMU 端点。
+  if (!propagated) return;
+  ++frame_num_;
   if(g_time_eva){
-    time_record_.Evaluate([this](){Propagation_Undistort();}, "Undistort");
     time_record_.Evaluate([this]() { DownSample(); }, "DownSample");
     time_record_.Evaluate([this]() { Observe(); }, "Observe");
     if (observation_valid_) time_record_.Evaluate([this]() { UpdateMap(); }, "UpdateMap");
   }else{
-    Propagation_Undistort();
     DownSample();
     Observe();
     if (observation_valid_) UpdateMap();
@@ -176,181 +169,42 @@ void SuperLIO::stateProcess(){
 }
 
 
-void SuperLIO::caceData(){
-  if(!g_save_map) return;
-  auto state = kf_->GetNavState();
-  Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
-  transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
-  transformation.block<3, 1>(0, 3) = state.p.cast<float>();
-
-  if(g_if_filter){
-    pcl::transformPointCloud(*ds_undistort_, *world_pc_, transformation);
-  }else{
-    pcl::transformPointCloud(*scan_undistort_full_, *world_pc_, transformation);
-  }
-
-  static int scan_wait_num = 0;
-  if(!world_pc_->empty()){
-    *point_map_ += *world_pc_;
-    scan_wait_num++;
-  }
-
-  if(g_pcd_save_interval < 0) {
-    scan_wait_num = 0;
-    return;
-  }
-
-  static bool rm_PCD_dir = false;
-  if(!rm_PCD_dir){
-    rm_PCD_dir = true;
-    std::string cmd = "rm -rf " + g_save_map_dir + "/PCD";
-    [[maybe_unused]] int res;
-    res = system(cmd.c_str());
-    cmd = "mkdir -p " + g_save_map_dir + "/PCD";
-    res = system(cmd.c_str());
-  }
-
-  if (point_map_->size() > 0 && scan_wait_num >= g_pcd_save_interval) {
-    pcd_index_++;
-    std::string map_name(std::string(g_save_map_dir + "/PCD/scans_") + std::to_string(pcd_index_) +
-                               std::string(".pcd"));
-    LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
-    pcl::io::savePCDFileBinary(map_name, *point_map_);
-    point_map_->clear();
-    scan_wait_num = 0;
-  }
-}
-
-
-void SuperLIO::ProcessCaceMap(){
-  namespace fs = std::filesystem;
-
-  std::string pcd_folder = g_save_map_dir + "/PCD";
-  std::string output_map_name = g_save_map_dir + "/" + g_map_name;
-
-  LOG(INFO) << YELLOW << " ---> Merging PCD fragments in: " << pcd_folder << RESET;
-
-  PointCloudType::Ptr merged_map(new PointCloudType());
-
-  int count = 0;
-  std::error_code directory_error;
-  fs::directory_iterator fragment_it(pcd_folder, directory_error), end;
-  if (directory_error) {
-    LOG(WARNING) << "Cannot read PCD directory: " << directory_error.message();
-    return;
-  }
-  for (; fragment_it != end; fragment_it.increment(directory_error)) {
-    if (directory_error) break;
-    const auto& entry = *fragment_it;
-    if (entry.path().extension() == ".pcd" &&
-      entry.path().filename().string().find("scans_") != std::string::npos) {
-      PointCloudType::Ptr tmp_cloud(new PointCloudType());
-      if (pcl::io::loadPCDFile<PointType>(entry.path().string(), *tmp_cloud) == 0) {
-        *merged_map += *tmp_cloud;
-        count++;
-        // LOG(INFO) << GREEN << " ---> Merged: " << entry.path().filename().string() 
-        //           << "   size: " << tmp_cloud->size() << RESET;
-      } else {
-        LOG(WARNING) << RED << " ---> Failed to load: " << entry.path().string() << RESET;
-      }
+bool SuperLIO::Propagation_Undistort(){
+  motion_covariances_.clear();
+  scan_undistort_full_->clear();
+  const auto& scan = measures_.lidar;
+  if (!scan.pc || scan.pc->empty() || !std::isfinite(scan.start_time) ||
+      !std::isfinite(scan.end_time) || scan.end_time < scan.start_time ||
+      scan.end_time <= kf_->GetTime()) return false;
+  std::vector<motion::Knot> knots;
+  const auto append_knot = [&]() {
+    const auto state = kf_->GetDynamicState();
+    motion::Knot knot;
+    knot.time = state.time; knot.R = state.R.cast<double>(); knot.p = state.p.cast<double>();
+    if (knots.empty()) knot.covariance = kf_->GetCov().cast<double>();
+    else {
+      knot.transition = kf_->GetTransition().cast<double>();
+      knot.noise = kf_->GetProcessNoise().cast<double>();
+      knot.covariance = knot.transition*knots.back().covariance*knot.transition.transpose()+knot.noise;
     }
-  }
-
-  if (directory_error) {
-    LOG(ERROR) << "Cannot iterate PCD directory: " << directory_error.message();
-    return;
-  }
-  if (merged_map->empty()) {
-    LOG(WARNING) << "No points in PCD fragments; skipping map save.";
-    return;
-  }
-  LOG(INFO) << YELLOW << " ---> Total merged fragments: " << count << RESET;
-
-  PointCloudType filtered_map;
-
-  if(g_if_filter){
-    LOG(INFO) << YELLOW << " ---> Downsampling merged map before final save..." << RESET;
-    pcl::VoxelGrid<PointType> voxel_filter;
-    voxel_filter.setLeafSize(g_map_ds_size, g_map_ds_size, g_map_ds_size);
-    
-    voxel_filter.setInputCloud(merged_map);
-    voxel_filter.filter(filtered_map);
-  }else{
-    LOG(INFO) << YELLOW << " ---> Not Downsampling merged map before final save..." << RESET;
-    filtered_map = *merged_map;
-  }
-  
-  if (filtered_map.size() > 0) {
-    filtered_map.width = filtered_map.size();
-    filtered_map.height = 1;
-    filtered_map.is_dense = false;
-  }
-
-  pcl::io::savePCDFileBinary(output_map_name, filtered_map);
-
-  LOG(INFO) << GREEN << " ---> Final map saved to: " << output_map_name << RESET;
-  LOG(INFO) << GREEN << " ---> Final map size: " << filtered_map.size() << RESET;
-}
-
-
-void SuperLIO::saveMap(){
-  if(!g_save_map) return;
-  if (!point_map_ || (point_map_->empty() && pcd_index_ < 0)) {
-    LOG(INFO) << "No map data collected; skipping map save.";
-    return;
-  }
-  std::error_code directory_error;
-  std::filesystem::create_directories(
-      g_pcd_save_interval > 0 ? g_save_map_dir + "/PCD" : g_save_map_dir,
-      directory_error);
-  if (directory_error) {
-    LOG(ERROR) << "Cannot create map directory: " << directory_error.message();
-    return;
-  }
-  if(g_pcd_save_interval > 0){
-    LOG(INFO) << YELLOW << " ---> Saving last cace ... " << RESET;
-    if (point_map_->size() > 0) {
-      pcd_index_++;
-      std::string map_name(std::string(g_save_map_dir + "/PCD/scans_") + std::to_string(pcd_index_) +
-                                 std::string(".pcd"));
-      LOG(INFO) << GREEN << " ---> current scan saved to /PCD/scans_" << pcd_index_ << "  size:  " << point_map_->size() << RESET;
-      pcl::io::savePCDFileBinary(map_name, *point_map_);
-      point_map_->clear();
-    }
-    LOG(INFO) << GREEN << " ---> Save last cace success. " << RESET;
-    LOG(INFO) << YELLOW << " ---> Process cace map ... " << RESET;
-    ProcessCaceMap();
-    return;
-  }
-
-  LOG(INFO) << YELLOW << " ---> Saving map..... " << RESET;
-  if(!point_map_->empty()){
-    std::string map_name = g_save_map_dir + "/" + g_map_name;
-    LOG(INFO) << YELLOW << " ---> Save map to: " << map_name << RESET;
-    pcl::VoxelGrid<PointType> voxel_fliter;
-    PointCloudType latst_map;
-    voxel_fliter.setInputCloud(point_map_);
-    voxel_fliter.setLeafSize(g_map_ds_size, g_map_ds_size, g_map_ds_size);
-    voxel_fliter.filter(latst_map);
-    if(latst_map.size() > 0){
-      latst_map.width = latst_map.size();
-      latst_map.height = 1;
-      latst_map.is_dense = false;
-    }
-    pcl::io::savePCDFileBinary(map_name, latst_map);
-    LOG(INFO) << GREEN << " ---> Save map success. File: " << map_name << RESET;
-    LOG(INFO) << GREEN << " ---> Map size: " << latst_map.size() << RESET;
-  }
-}
-
-
-void SuperLIO::Propagation_Undistort(){
+    knots.push_back(knot);
+  };
   propagate_states_.clear();
   propagate_states_.emplace_back(kf_->GetDynamicState());
+  if (uncertainty_motion_) append_knot();
   kf_->SetObsTime(measures_.lidar.end_time);
   for (auto &imu : measures_.imu) {
-    if (kf_->Predict(imu) && kf_->GetTime() > propagate_states_.back().time)
+    if (kf_->Predict(imu) && kf_->GetTime() > propagate_states_.back().time) {
       propagate_states_.emplace_back(kf_->GetDynamicState());
+      if (uncertainty_motion_) append_knot();
+    }
+  }
+
+  // Predict 可能因坏输入/数值失败拒绝一步。不能把最后一次成功传播时刻
+  // 当成扫描末端，否则去畸变会夹取未覆盖的点并将其当作有效观测。
+  if (propagate_states_.size() < 2 || kf_->GetTime() != scan.end_time) {
+    ROS_WARN_THROTTLE(1.0, "Incomplete IMU propagation; skipping LiDAR scan");
+    return false;
   }
 
   const M3 TLI_R = g_lidar_imu.R_;
@@ -359,7 +213,12 @@ void SuperLIO::Propagation_Undistort(){
   auto& raw_pc = measures_.lidar.pc;
 
   std::size_t ptsize = raw_pc->points.size();
-  scan_undistort_full_->resize(ptsize); 
+  scan_undistort_full_->resize(ptsize);
+  std::vector<motion::M3> point_covariances;
+  if (uncertainty_motion_) {
+    motion::relativeCovariances(knots);
+    point_covariances.resize(ptsize);
+  }
 
   tbb::parallel_for(
   tbb::blocked_range<size_t>(0, ptsize),
@@ -370,12 +229,30 @@ void SuperLIO::Propagation_Undistort(){
       pt_full.intensity = pt.intensity;
       const double query_time = start_time + pt.offset_time;
       const V3 raw(pt.x, pt.y, pt.z);
-      const V3 eigen_point = deskewPoint(TLI_R * raw + TLI_t, query_time, propagate_states_);
+      const V3 eigen_point = deskewPoint(TLI_R * raw + TLI_t, query_time, propagate_states_, smooth_motion_);
       pt_full.x = eigen_point[0];
       pt_full.y = eigen_point[1];
       pt_full.z = eigen_point[2];
+      if (uncertainty_motion_)
+        point_covariances[idx] = motion::pointCovariance(eigen_point.cast<double>(), query_time, knots);
     }
   });
+  for (const auto& p : *scan_undistort_full_) {
+    if (!p.getVector3fMap().allFinite()) {
+      scan_undistort_full_->clear();
+      return false;
+    }
+  }
+  if (uncertainty_motion_) {
+    motion_covariances_.reserve(ptsize);
+    for (size_t i=0;i<ptsize;++i) {
+      const auto& p = scan_undistort_full_->points[i];
+      auto result = motion_covariances_.emplace(std::array<float,3>{p.x,p.y,p.z}, point_covariances[i]);
+      // Coincident samples may have different times: sum is a conservative PSD bound.
+      if (!result.second) result.first->second += point_covariances[i];
+    }
+  }
+  return true;
 }
 
 
@@ -396,7 +273,14 @@ void SuperLIO::AnalyzeSamplingGeometry() {
         !compute_error(plane, world, body.norm(), residual)) continue;
     const auto J = geometry::poseJacobian(body.cast<double>(), pose.R_.cast<double>(),
                                           geometry::V3(plane[0],plane[1],plane[2]));
-    G += 1000 * J * J.transpose();
+    double variance = 0.001;
+    if (uncertainty_motion_) {
+      const auto it = motion_covariances_.find({p.x,p.y,p.z});
+      if (it == motion_covariances_.end() || !it->second.allFinite()) continue;
+      const Eigen::Vector3d nb = pose.R_.cast<double>().transpose()*J.tail<3>();
+      variance += std::max(0.0, nb.dot(it->second*nb));
+    }
+    G += J * J.transpose()/variance;
   }
   degeneracy_ = geometry_analyzer_.analyze(G, geometry_options_, true);
   sampling_geometry_analyzed_ = true;
@@ -410,6 +294,7 @@ struct ThreadACC{
 };
 
 
+// plane_only 用于从同一先验重放平面观测，禁止再次补偿或递归回退；谱保护仍生效。
 void SuperLIO::Observe(bool plane_only){
   observation_valid_ = false;
   size_t ptsize = ds_undistort_->size();
@@ -420,6 +305,19 @@ void SuperLIO::Observe(bool plane_only){
   geometry_stats_ = geometry::Diagnostics{};
   std::vector<geometry::V6> plane_J;
   std::vector<double> plane_error;
+  std::vector<double> plane_precisions(ptsize, 1000.0);
+  std::vector<motion::M3> sampled_covariances;
+  if (uncertainty_motion_) {
+    sampled_covariances.reserve(ptsize);
+    for (const auto& p : *ds_undistort_) {
+      const auto it = motion_covariances_.find({p.x,p.y,p.z});
+      if (it == motion_covariances_.end() || !it->second.allFinite()) {
+        ROS_ERROR_THROTTLE(1.0, "Missing or invalid motion covariance: rejecting scan update");
+        return;
+      }
+      sampled_covariances.push_back(it->second);
+    }
+  }
   if (geometry_options_.enable_degeneracy) {
     plane_J.resize(ptsize, geometry::V6::Zero());
     plane_error.resize(ptsize, 0);
@@ -494,10 +392,12 @@ void SuperLIO::Observe(bool plane_only){
               plane_J[idx] = J;
               plane_error[idx] = error;
             }
-            // Plane reliability is handled by the original correspondence/residual gates.
-            // Keep Rp=0.001 in every geometry state; only selected bump rows get their own Rb.
-            local_acc.HTVH += J * 1000 * J.transpose();
-            local_acc.HTVr -= J * 1000 * error;
+            double variance = 0.001;
+            if (uncertainty_motion_)
+              variance += std::max(0.0, nb.dot(sampled_covariances[idx]*nb));
+            plane_precisions[idx] = 1.0/variance;
+            local_acc.HTVH += J * plane_precisions[idx] * J.transpose();
+            local_acc.HTVr -= J * plane_precisions[idx] * error;
           }
         }
     });
@@ -508,6 +408,7 @@ void SuperLIO::Observe(bool plane_only){
       sum_HTVH += local_acc.HTVH;
       sum_HTVr += local_acc.HTVr;
     }
+    // 平面谱用于选择补偿方向；最终平面/曲面混合系统稍后单独计算谱可靠性。
     if (geometry_options_.enable_degeneracy) {
       using Clock = std::chrono::steady_clock;
       const auto analysis_start = Clock::now();
@@ -530,11 +431,17 @@ void SuperLIO::Observe(bool plane_only){
         }
         geometry::Candidate c; c.index = i;
         if (geometry::candidate(surface, points_body_v3_[i].cast<double>(), pose.R_.cast<double>(),
-                                degeneracy_, geometry_options_, c, geometry_stats_)) candidates.push_back(c);
+                                degeneracy_, geometry_options_, c, geometry_stats_)) {
+          if (uncertainty_motion_) {
+            const Eigen::Vector3d nb = R_transpose*c.J.tail<3>();
+            c.variance += std::max(0.0, nb.dot(sampled_covariances[i]*nb));
+          }
+          candidates.push_back(c);
+        }
       }
       geometry::selectWeakDirectionConstraints(candidates, degeneracy_, geometry_options_);
       // Strategy A: only final accepted indices replace their own plane rows.
-      geometry::applyExclusiveBumps(plane_J, plane_error, effect_mask_, candidates, sum_HTVH, sum_HTVr);
+      geometry::applyExclusiveBumps(plane_J, plane_error, effect_mask_, candidates, sum_HTVH, sum_HTVr, 1000.0, &plane_precisions);
       double bump_squared = 0;
       for (const auto& c : candidates) {
         plane_squared -= plane_error[c.index]*plane_error[c.index];
@@ -556,6 +463,13 @@ void SuperLIO::Observe(bool plane_only){
       }
       geometry_stats_.plane_rms = std::sqrt(std::max(0.0, plane_squared)/std::max(1, geometry_stats_.planes));
       geometry_stats_.bump_ms = std::chrono::duration<double, std::milli>(Clock::now()-bump_start).count();
+    }
+    // 必须在曲面替换之后加权，避免压制已经恢复的方向；平面回退也不能绕过保护。
+    if (geometry_options_.enable_spectral_reliability &&
+        !geometry::applySpectralReliability(sum_HTVH, sum_HTVr, geometry_options_, geometry_stats_)) {
+      // ESKF rejects zero information and restores the complete propagated prior.
+      sum_HTVH.setZero();
+      sum_HTVr.setZero();
     }
     ++observation_calls;
     HTVH = sum_HTVH.cast<scalar>();
@@ -595,6 +509,7 @@ void SuperLIO::Observe(bool plane_only){
   if (!plane_only && geometry_options_.enable_bump_measurement &&
       (abnormal || (no_final_bump && (changed_sampling || used_bump)))) {
     const auto attempted = geometry_stats_;
+    // 恢复整帧先验与原采样后重做对应关系，不能混用增强采样的缓存或后验。
     *kf_ = prior;
     if (original_sample_) ds_undistort_ = original_sample_;
     // Rebuild points, masks, correspondences and all iterations from the original prior/sample.

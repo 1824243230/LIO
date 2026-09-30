@@ -1,5 +1,9 @@
 // type, ROS key/member, default. Loaded under /lio/geometry.
 GOPT(bool, enable_degeneracy, false)
+// 最终激光信息的方向降权；必须同时开启 enable_degeneracy，默认不改变基础算法。
+GOPT(bool, enable_spectral_reliability, false)
+// 相对最大特征值达到此比例后不再降权；无量纲，尚需真实退化数据标定。
+GOPT(double, spectral_full_ratio, 0.02)
 GOPT(bool, enable_bump_layer, false)
 GOPT(bool, enable_informed_sampling, false)
 GOPT(bool, enable_bump_measurement, false)

@@ -3,6 +3,8 @@
 lio:
   geometry:
     enable_degeneracy: false
+    enable_spectral_reliability: false
+    spectral_full_ratio: 0.02
     enable_bump_layer: false
     enable_informed_sampling: false
     enable_bump_measurement: false

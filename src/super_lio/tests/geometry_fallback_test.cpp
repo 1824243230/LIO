@@ -37,6 +37,7 @@ class Harness : public SuperLIO {
     ds_undistort_.reset(new PointCloudType(*scan_undistort_full_));
     check(ds_undistort_->size()>original_sample_->size(),"test starts from distinct finer sample");
   }
+  void enable_spectral() { geometry_options_.enable_spectral_reliability=true; }
   void remove_map() { bump_map_.reset(); }
   void fail_analysis() { geometry_options_.rotation_length_scale=std::numeric_limits<double>::quiet_NaN(); }
   void run() { ++frame_num_; Observe(); }
@@ -78,5 +79,15 @@ void verify_case(int failure) {
 }
 int main() {
   for(int failure=0;failure<3;++failure) verify_case(failure);
+  Harness protected_plane;
+  protected_plane.prepare(true);
+  protected_plane.enable_spectral();
+  protected_plane.emulate_changed_sampling();
+  protected_plane.run();
+  protected_plane.verify_restoration();
+  check(protected_plane.diagnostics().fallback && protected_plane.diagnostics().spectral_valid &&
+        protected_plane.diagnostics().spectral_attenuated >= 3,
+        "spectral protection survives original-sample plane replay");
+  check(protected_plane.state().p.norm()>0.001, "protected plane keeps observable correction");
   std::cout << "fallback tests passed: empty map, absent map, invalid analysis vs all-flags-off baseline\n";
 }

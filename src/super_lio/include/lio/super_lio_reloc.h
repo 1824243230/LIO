@@ -32,6 +32,9 @@ private:
   void Output() override;
 
 private:
+  int init_frame_count_ = 0;
+  bool map_loaded_ = false;
+  int map_update_delay_ = 100;
   BASIC::CloudPtr init_obs_data_;
   bool flg_get_init_guess_ = false;
   BASIC::SE3 re_init_pose_;

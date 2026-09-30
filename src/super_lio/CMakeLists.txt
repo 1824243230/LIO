@@ -57,7 +57,7 @@ catkin_package(
 )
 
 # LIO library source files
-file(GLOB_RECURSE LIO_LIB_SRC "src/lio/*.cpp" "src/ros/*.cpp")
+file(GLOB_RECURSE LIO_LIB_SRC CONFIGURE_DEPENDS "src/lio/*.cpp" "src/ros/*.cpp")
 
 file(GLOB_RECURSE LIO_LIB_HEADERS "include/lio/*.hpp" "include/lio/*.h")
 
@@ -99,6 +99,23 @@ target_link_libraries(relocation_node
 )
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(map_io_test tests/map_io_test.cpp)
+  target_link_libraries(map_io_test lio)
+  add_test(NAME map_io COMMAND map_io_test)
+  add_executable(deep_logic_test tests/deep_logic_test.cpp)
+  target_link_libraries(deep_logic_test lio)
+  add_test(NAME deep_logic COMMAND deep_logic_test)
+  add_executable(logic_review_test tests/logic_review_test.cpp)
+  target_link_libraries(logic_review_test lio)
+  add_test(NAME logic_review COMMAND logic_review_test)
+  add_executable(motion_uncertainty_test tests/motion_uncertainty_test.cpp)
+  target_link_libraries(motion_uncertainty_test lio)
+  add_test(NAME motion_uncertainty COMMAND motion_uncertainty_test)
+  add_executable(input_review_test tests/input_review_test.cpp)
+  target_link_libraries(input_review_test lio)
+  add_test(NAME input_review COMMAND input_review_test)
+  add_executable(spectral_reliability_test tests/spectral_reliability_test.cpp src/lio/geometry.cpp)
+  add_test(NAME spectral_reliability COMMAND spectral_reliability_test)
   add_executable(lio_numerics_test tests/lio_numerics_test.cpp)
   target_link_libraries(lio_numerics_test lio)
   add_test(NAME lio_numerics COMMAND lio_numerics_test)

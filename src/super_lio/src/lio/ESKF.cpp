@@ -1,4 +1,6 @@
 #include "lio/ESKF.h"
+#include "lio/motion_uncertainty.h"
+#include <stdexcept>
 
 using namespace BASIC;
 
@@ -84,8 +86,10 @@ void ESKF::SetInitialConditions(Options options, const V3& init_bg,
 
 
 void ESKF::SetX(const SysState& x) {
-  last_imu_time_ = x.timestamp;      // TODO: The timestamp update is not strictly consistent.
-  current_time_ = last_imu_time_;
+  // 只在缓存测量确实属于该时刻时保留它；单改时间会把旧测量伪装成新端点。
+  if (last_imu_time_ != x.timestamp || last_imu_.secs != x.timestamp)
+    last_imu_time_ = -1.0;
+  current_time_ = x.timestamp;
   R_ = x.R;
   p_ = x.p;
   v_ = x.v;
@@ -94,8 +98,18 @@ void ESKF::SetX(const SysState& x) {
   fw_R_ = R_;
   fw_p_ = p_;
   fw_v_ = v_;
+  forward_time_ = last_imu_time_;
+  forward_last_imu_ = last_imu_;
 }
 
+void ESKF::SetX(const SysState& x, const IMUData& imu) {
+  if (!std::isfinite(imu.secs) || imu.secs != x.timestamp ||
+      !imu.acc.allFinite() || !imu.gyr.allFinite())
+    throw std::invalid_argument("initial state and IMU must share a finite timestamp");
+  SetX(x);
+  last_imu_ = forward_last_imu_ = imu;
+  last_imu_time_ = forward_time_ = imu.secs;
+}
 
 void ESKF::BuildNoise(const Options& options) {
   double et = options.gyro_var_;
@@ -129,12 +143,15 @@ void ESKF::Update() {
   fw_R_ = R_;
   fw_p_ = p_;
   fw_v_ = v_;
-  forward_time_ = current_obs_time_;
+  // 激光校正把高频预测轨迹拉回滤波状态；时间与积分左端测量必须一起回退。
+  // last_imu_ 是 Predict 插值到扫描末端的测量，不是 ROS 最近收到的未来测量。
+  forward_time_ = last_imu_time_ == current_time_ ? current_time_ : -1.0;
+  forward_last_imu_ = last_imu_;
 }
 
 
 bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot){
-  if(!init_) {
+  if(!init_ || !std::isfinite(imu.secs) || !imu.acc.allFinite() || !imu.gyr.allFinite()) {
     return false;
   }
 
@@ -147,7 +164,7 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
 
   double dt = imu.secs - forward_time_;
 
-  if(dt < 0 || dt > 0.2){
+  if(dt <= 0 || dt > 0.2){
     return false;
   }
 
@@ -160,6 +177,14 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
   V3 new_v = fw_v_ + fw_R_.R() * acc * dt + g_ * dt;
   SO3 new_R = fw_R_ * SO3::Exp(gyr , dt);
 
+  if (options_.smooth_motion_) {
+    M3d Iv, Ip;
+    motion::integrals(gyr.cast<double>(), dt, Iv, Ip);
+    new_p = fw_p_ + fw_v_*dt + (fw_R_.R_.cast<double>()*Ip*acc.cast<double>()).cast<scalar>() + 0.5*g_*dt*dt;
+    new_v = fw_v_ + (fw_R_.R_.cast<double>()*Iv*acc.cast<double>()).cast<scalar>() + g_*dt;
+  }
+  if (!new_R.R_.allFinite() || !new_p.allFinite() || !new_v.allFinite() ||
+      !acc.allFinite() || !gyr.allFinite()) return false;
   fw_R_ = new_R;
   fw_v_ = new_v;
   fw_p_ = new_p;
@@ -186,9 +211,11 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
 
 bool ESKF::Predict(const IMUData& imu) {
 
-  if (!std::isfinite(imu.secs) || !imu.acc.allFinite() || !imu.gyr.allFinite()) return false;
+  if (!std::isfinite(imu.secs) || !std::isfinite(current_obs_time_) ||
+      !imu.acc.allFinite() || !imu.gyr.allFinite()) return false;
 
   if(last_imu_time_ < 0){
+    if (imu.secs < current_time_) return false;
     last_imu_time_ = imu.secs;
     last_imu_ = imu;
     current_time_ = imu.secs;
@@ -196,13 +223,9 @@ bool ESKF::Predict(const IMUData& imu) {
   }
 
   if (imu.secs <= last_imu_time_) return false;
-  if(imu.secs <= last_obs_time_){
-    last_imu_time_ = imu.secs;
-    last_imu_ = imu;
-    return false;
-  }
-  
-  const double start = std::max(last_imu_time_, last_obs_time_);
+  // 名义状态和 IMU 左端点共同定义积分起点。last_obs_time 只是观测记录，
+  // 不能用于跳过尚未积分的时间（尤其初始化或观测失败后的扫描）。
+  const double start = last_imu_time_;
   const double end = std::min(imu.secs, current_obs_time_);
   const double dt = end - start;
   if (!std::isfinite(dt) || dt <= 0) return false;
@@ -215,21 +238,25 @@ bool ESKF::Predict(const IMUData& imu) {
   endpoint.secs = end;
   endpoint.acc = last_imu_.acc + alpha_end * (imu.acc - last_imu_.acc);
   endpoint.gyr = last_imu_.gyr + alpha_end * (imu.gyr - last_imu_.gyr);
-  current_time_ = end;
 
   V3 acc = 0.5 * (endpoint.acc + acc_start);
   acc = imu_scale_ * acc;
   acc = acc - ba_;
-  body_omega_ = 0.5 * (endpoint.gyr + gyr_start) - bg_;
-  M3 Jr_dt = (dt * RightJacobianSO3(body_omega_, dt)).cast<scalar>();   // J_l(-phi) = J_r(phi)
+  const V3 omega = 0.5 * (endpoint.gyr + gyr_start) - bg_;
+  M3 Jr_dt = (dt * RightJacobianSO3(omega, dt)).cast<scalar>();   // J_l(-phi) = J_r(phi)
 
   M3 R_m3 = R_.R_;
   M3 R_dt = R_m3 * dt;
 
   F_X f_x = F_X::Identity();
-  f_x.template block<3, 3>(0, 0) = SO3::Exp(-body_omega_, dt).R_;
+  f_x.template block<3, 3>(0, 0) = SO3::Exp(-omega, dt).R_;
   f_x.template block<3, 3>(0, 9) = - Jr_dt;
   f_x.template block<3, 3>(3, 6) = M3::Identity() * dt;
+  // 基础模型 p+=v*dt+0.5*(R*a+g)*dt² 的导数也必须进入协方差。
+  // 否则名义位置已受加速度影响，协方差却假设没有对应误差/噪声。
+  f_x.template block<3, 3>(3, 0) = -0.5 * R_m3 * SO3::hat(acc) * dt * dt;
+  f_x.template block<3, 3>(3, 12) = -0.5 * R_m3 * dt * dt;
+  f_x.template block<3, 3>(3, 15) = 0.5 * M3::Identity() * dt * dt;
   f_x.template block<3, 3>(6, 0) = - R_m3 * SO3::hat(acc) * dt;
   f_x.template block<3, 3>(6, 12) = - R_dt;
   f_x.template block<3, 3>(6, 15) = M3::Identity() * dt;
@@ -237,18 +264,61 @@ bool ESKF::Predict(const IMUData& imu) {
 
   F_W f_w = F_W::Zero();
   f_w.template block<3, 3>(0, 0) = - Jr_dt;
+  f_w.template block<3, 3>(3, 3) = -0.5 * R_m3 * dt * dt; // p -> na
   f_w.template block<3, 3>(6, 3) = - R_dt;                 // v -> na
-  f_w.template block<3, 3>(9, 6) = M3::Identity() * dt;    // ba
-  f_w.template block<3, 3>(12, 9) = M3::Identity() * dt;   // bg
+  f_w.template block<3, 3>(9, 6) = M3::Identity() * dt;    // gyro bias random walk
+  f_w.template block<3, 3>(12, 9) = M3::Identity() * dt;   // accelerometer bias random walk
 
-  P_ = f_x * P_ * f_x.transpose() + f_w * Q_ * f_w.transpose();
+  M3d Iv, Ip;
+  if (options_.smooth_motion_) {
+    motion::integrals(omega.cast<double>(), dt, Iv, Ip);
+    const M3d Rd = R_m3.cast<double>();
+    const V3d ad = acc.cast<double>();
+    // Jacobians of the same rotating-force integrals used by the nominal state.
+    M3d Dv, Dp;
+    constexpr double eps = 1e-5;
+    for (int j=0;j<3;++j) {
+      V3d plus = omega.cast<double>(), minus = plus;
+      plus[j] += eps; minus[j] -= eps;
+      M3d vp, pp, vm, pm;
+      motion::integrals(plus, dt, vp, pp); motion::integrals(minus, dt, vm, pm);
+      Dv.col(j) = Rd*(vp-vm)*ad/(2*eps);
+      Dp.col(j) = Rd*(pp-pm)*ad/(2*eps);
+    }
+    f_x.block<3,3>(3,0) = (-Rd*motion::hat(Ip*ad)).cast<scalar>();
+    f_x.block<3,3>(6,0) = (-Rd*motion::hat(Iv*ad)).cast<scalar>();
+    f_x.block<3,3>(3,9) = -Dp.cast<scalar>();
+    f_x.block<3,3>(6,9) = -Dv.cast<scalar>();
+    f_x.block<3,3>(3,12) = (-Rd*Ip).cast<scalar>();
+    f_x.block<3,3>(6,12) = (-Rd*Iv).cast<scalar>();
+    f_x.block<3,3>(3,15) = M3::Identity()*(0.5*dt*dt);
+    f_w.block<3,3>(3,0) = -Dp.cast<scalar>();
+    f_w.block<3,3>(6,0) = -Dv.cast<scalar>();
+    f_w.block<3,3>(3,3) = (-Rd*Ip).cast<scalar>();
+    f_w.block<3,3>(6,3) = (-Rd*Iv).cast<scalar>();
+  }
+  // 所有候选量在局部计算；非有限输入运算结果不能推进时间或污染缓存。
+  const COV process_noise = f_w * Q_ * f_w.transpose();
+  COV covariance = f_x * P_ * f_x.transpose() + process_noise;
+  covariance = (0.5*(covariance+covariance.transpose())).eval();
+  const V3 acc_world = R_m3 * acc + g_;
+  V3 position, velocity;
+  if (options_.smooth_motion_) {
+    position = p_ + v_*dt + (R_m3.cast<double>()*Ip*acc.cast<double>()).cast<scalar>() + 0.5*g_*dt*dt;
+    velocity = v_ + (R_m3.cast<double>()*Iv*acc.cast<double>()).cast<scalar>() + g_*dt;
+  } else {
+    position = p_ + v_*dt + 0.5*acc_world*dt*dt;
+    velocity = v_ + acc_world*dt;
+  }
+  const SO3 rotation = R_ * SO3::Exp(omega, dt);
+  if (!position.allFinite() || !velocity.allFinite() || !rotation.R_.allFinite() ||
+      !acc.allFinite() || !omega.allFinite() || !acc_world.allFinite() ||
+      !f_x.allFinite() || !process_noise.allFinite() || !covariance.allFinite()) return false;
 
-  global_acc_ = R_.R() * acc + g_;
-  p_ = p_ + v_ * dt + 0.5 * global_acc_ * dt * dt;
-  v_ = v_ + global_acc_ * dt;
-  R_ = R_ * SO3::Exp(body_omega_, dt);
-
-  last_imu_time_ = end;
+  p_ = position; v_ = velocity; R_ = rotation; P_ = covariance;
+  body_omega_ = omega; global_acc_ = acc_world; specific_force_ = acc;
+  last_transition_ = f_x; last_process_noise_ = process_noise;
+  current_time_ = last_imu_time_ = end;
   last_imu_ = endpoint;
   return true;
 }
@@ -256,6 +326,7 @@ bool ESKF::Predict(const IMUData& imu) {
 
 const int STATE_DIM = 18;
 bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> correction_guard) {
+  // 保存整帧传播先验；任一迭代失败必须恢复状态、协方差和时间，不能保留半次更新。
   const ESKF prior = *this;
   const auto reject = [&]() { *this = prior; return false; };
   if (options_.num_iterations_ <= 0 || !P_.allFinite()) return reject();
@@ -267,6 +338,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
   V3  ba_pred = ba_;
   V3  g_pred = g_;
 
+  // 迭代重新线性化同一帧激光，不是连续融合多次独立测量；始终使用同一先验。
   M18 P_pred = P_;
 
   M6 HTVH;
@@ -305,6 +377,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
 
     dx_prior = G_prior * dx_prior;
 
+    // 激光直接约束前 6 维位姿，其余状态通过完整先验的交叉协方差间接修正。
     // H^T R^{-1} H
     M18 HTRH = M18::Zero();
     HTRH.template block<6,6>(0,0) = HTVH;
@@ -343,6 +416,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
 
   P_ = Qk;
 
+  // 误差注入名义姿态后，协方差需搬到新的姿态切空间，并检查正定性。
   M18 G_reset = M18::Identity();
   M3 J_reset = M3::Identity()
              - 0.5 * SO3::hat(dx_.template block<3,1>(0,0));

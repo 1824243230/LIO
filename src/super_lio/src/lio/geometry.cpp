@@ -7,11 +7,14 @@
 
 namespace LI2Sup { namespace geometry {
 namespace { double unit(double x) { return std::clamp(x, 0.0, 1.0); } }
+// 统一校验所有开关组合、迟滞阈值及方差边界，避免部分模块带着非法配置运行。
 bool Options::valid(double size) const {
 #define GOPT(type, name, value) if (!std::isfinite(static_cast<double>(name))) return false;
 #include "lio/geometry_options.def"
 #undef GOPT
   return size > 0 && std::isfinite(size) && rotation_length_scale > 0 &&
+    spectral_full_ratio > 0 && spectral_full_ratio <= 1 &&
+    (!enable_spectral_reliability || enable_degeneracy) &&
     degeneracy_ratio_enter_degenerate > 0 &&
     degeneracy_ratio_enter_degenerate < degeneracy_ratio_exit_degenerate &&
     degeneracy_ratio_exit_degenerate < degeneracy_ratio_enter_weak &&
@@ -32,6 +35,55 @@ bool Options::valid(double size) const {
     sigma_b_min > 0 && sigma_b_base >= sigma_b_min && sigma_b_max >= sigma_b_base &&
     bump_degenerate_variance_factor > 0 && bump_degenerate_variance_factor <= 1 &&
     bump_max_translation_correction > 0 && bump_max_rotation_correction > 0;
+}
+bool applySpectralReliability(M6& information, V6& rhs, const Options& o,
+                              Diagnostics& diagnostics) {
+  diagnostics.spectral_valid = false;
+  diagnostics.spectral_attenuated = 0;
+  diagnostics.spectral_min_gain = 1;
+  if (!information.allFinite() || !rhs.allFinite() ||
+      !std::isfinite(o.rotation_length_scale) || o.rotation_length_scale <= 0 ||
+      !std::isfinite(o.spectral_full_ratio) || o.spectral_full_ratio <= 0 ||
+      o.spectral_full_ratio > 1) return false;
+  // 用特征长度把旋转和平移放到可比较的尺度：x = S z，z = [ℓδθ, δp]。
+  // 信息矩阵作合同变换，右端项也必须同步变换，不能只缩放特征值。
+  M6 S = M6::Identity(), inverse_S = M6::Identity();
+  S.topLeftCorner<3,3>() /= o.rotation_length_scale;
+  inverse_S.topLeftCorner<3,3>() *= o.rotation_length_scale;
+  const M6 A = S * (0.5 * information + 0.5 * information.transpose()) * S;
+  const V6 b = S * rhs;
+  if (!A.allFinite() || !b.allFinite()) return false;
+  Eigen::SelfAdjointEigenSolver<M6> eig(A);
+  if (eig.info() != Eigen::Success || !eig.eigenvalues().allFinite() ||
+      !eig.eigenvectors().allFinite()) return false;
+  const double largest = eig.eigenvalues().maxCoeff();
+  if (largest <= 0 || eig.eigenvalues().minCoeff() < -1e-8 * largest) return false;
+  V6 gains, eigenvalues;
+  int attenuated = 0;
+  for (int k = 0; k < 6; ++k) {
+    const double ratio = std::max(0.0, eig.eigenvalues()[k]) / largest;
+    // Treat numerical null modes as null; do not preserve unsupported rhs components.
+    const double t = ratio <= 1e-12 ? 0 : unit(ratio / o.spectral_full_ratio);
+    gains[k] = t*t*(3-2*t); // C1 smooth transition, exactly one in reliable modes.
+    eigenvalues[k] = gains[k] * std::max(0.0, eig.eigenvalues()[k]);
+    attenuated += gains[k] < 1;
+  }
+  // 仅在有弱方向时重建；强约束系统保持原数值，避免无意义的分解重构误差。
+  if (attenuated) {
+    const M6 next_A = inverse_S * eig.eigenvectors() * eigenvalues.asDiagonal() *
+                      eig.eigenvectors().transpose() * inverse_S;
+    // 同一 gi 同时作用于二次项和一次项，保证状态更新与后验置信度相匹配。
+    const V6 next_b = inverse_S * eig.eigenvectors() * gains.asDiagonal() *
+                      eig.eigenvectors().transpose() * b;
+    if (!next_A.allFinite() || !next_b.allFinite()) return false;
+    // 全部结果验证通过后再提交；失败时调用者仍持有原始观测方程。
+    information = 0.5 * next_A + 0.5 * next_A.transpose();
+    rhs = next_b;
+  }
+  diagnostics.spectral_valid = true;
+  diagnostics.spectral_attenuated = attenuated;
+  diagnostics.spectral_min_gain = gains.minCoeff();
+  return true;
 }
 DegeneracyResult Analyzer::analyze(const M6& information, const Options& o, bool advance) {
   DegeneracyResult d;
@@ -58,6 +110,7 @@ DegeneracyResult Analyzer::analyze(const M6& information, const Options& o, bool
   else if (d.ratio < o.degeneracy_ratio_enter_weak) next = Status::WEAK;
   else if (status_ != Status::NORMAL && d.ratio < o.degeneracy_ratio_exit_weak) next = Status::WEAK;
   else next = Status::NORMAL;
+  // 每帧只推进一次迟滞状态；同帧迭代和回退重算只更新谱，不能重复推进。
   if (advance) status_ = next;
   d.status = status_;
   d.valid = true;
@@ -276,11 +329,12 @@ void selectWeakDirectionConstraints(std::vector<Candidate>& candidates,
   }
   candidates.resize(count);
 }
+// 一个点只能贡献平面或曲面中的一条观测，先减旧行再加新行，防止重复计入信息。
 void applyExclusiveBumps(const std::vector<V6>& plane_jacobians,
                          const std::vector<double>& plane_residuals,
                          const std::vector<unsigned char>& plane_valid,
                          std::vector<Candidate>& selected, M6& information, V6& rhs,
-                         double plane_precision) {
+                         double plane_precision, const std::vector<double>* plane_precisions) {
   if (!information.allFinite() || !rhs.allFinite() || !std::isfinite(plane_precision) || plane_precision <= 0) {
     selected.clear(); return;
   }
@@ -292,9 +346,12 @@ void applyExclusiveBumps(const std::vector<V6>& plane_jacobians,
         !plane_valid[i] || replaced.count(i) || !c.J.allFinite() || !std::isfinite(c.residual) ||
         !std::isfinite(c.variance) || c.variance <= 0 || !plane_jacobians[i].allFinite() ||
         !std::isfinite(plane_residuals[i])) continue;
+    if (plane_precisions && (i >= plane_precisions->size() ||
+        !std::isfinite((*plane_precisions)[i]) || (*plane_precisions)[i] <= 0)) continue;
+    const double precision = plane_precisions ? (*plane_precisions)[i] : plane_precision;
     const auto& Jp = plane_jacobians[i];
-    const M6 next_information = information - plane_precision*Jp*Jp.transpose() + c.J*c.J.transpose()/c.variance;
-    const V6 next_rhs = rhs + plane_precision*Jp*plane_residuals[i] - c.J*c.residual/c.variance;
+    const M6 next_information = information - precision*Jp*Jp.transpose() + c.J*c.J.transpose()/c.variance;
+    const V6 next_rhs = rhs + precision*Jp*plane_residuals[i] - c.J*c.residual/c.variance;
     if (!next_information.allFinite() || !next_rhs.allFinite()) continue;
     information = next_information;
     rhs = next_rhs;
@@ -342,6 +399,7 @@ bool candidate(const Surface& s, const V3& body, const M3& rotation,
   if (s.gradient < o.bump_min_gradient) { ++stats.rejected_gradient; return false; }
   if (s.confidence < o.bump_min_pixel_confidence) { ++stats.rejected_pixel; return false; }
   if (!std::isfinite(s.residual) || std::abs(s.residual) >= o.bump_residual_max) { ++stats.rejected_residual; return false; }
+  // 曲面法向含高度梯度；归一化会改变残差导数，因此保留其实际幅值。
   c.J = poseJacobian(body, rotation, s.normal);
   if (!c.J.allFinite()) return false;
   V6 scaled = c.J; scaled.head<3>() /= o.rotation_length_scale;

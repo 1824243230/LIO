@@ -108,8 +108,13 @@ void applyExclusiveBumps(const std::vector<V6>& plane_jacobians,
                          const std::vector<double>& plane_residuals,
                          const std::vector<unsigned char>& plane_valid,
                          std::vector<Candidate>& selected, M6& information, V6& rhs,
-                         double plane_precision = 1000.0);
+                         double plane_precision = 1000.0,
+                         const std::vector<double>* plane_precisions = nullptr);
 struct Diagnostics {
+  // 最终观测系统中降权方向的数量和最小权重，非轨迹精度指标。
+  int spectral_attenuated = 0;
+  double spectral_min_gain = 1;
+  bool spectral_valid = false;
   int candidates = 0, accepted = 0, planes = 0;
   int rejected_map = 0, rejected_mid = 0, rejected_gradient = 0;
   int rejected_pixel = 0, rejected_weak = 0, rejected_residual = 0;
@@ -117,6 +122,10 @@ struct Diagnostics {
   double plane_rms = 0, bump_rms = 0, analysis_ms = 0, bump_ms = 0;
   bool fallback = false;
 };
+// Attenuate unreliable modes of the FINAL measurement system, including bumps.
+// Atomic on failure. Never modifies the IMU prior or adds measurement information.
+bool applySpectralReliability(M6& information, V6& rhs, const Options& options,
+                              Diagnostics& diagnostics);
 // Huber IRLS weight; invalid inputs return zero and must be rejected.
 double huberWeight(double residual, double delta);
 bool degeneracySeverity(double ratio, const Options& options, double& severity);

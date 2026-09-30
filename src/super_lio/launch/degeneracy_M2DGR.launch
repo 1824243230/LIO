@@ -1,12 +1,18 @@
 <launch>
   <arg name="rviz" default="true"/>
   <arg name="enable" default="false"/>
+  <arg name="smooth" default="false"/>
+  <arg name="uamc" default="false"/>
+  <param name="/lio/motion/smooth_propagation" value="$(arg smooth)"/>
+  <param name="/lio/motion/uncertainty_aware" value="$(arg uamc)"/>
+  <arg name="spectral" default="false"/>
   <arg name="csv_path" default=""/>
   <include file="$(find super_lio)/launch/M2DGR.launch">
     <arg name="rviz" value="$(arg rviz)"/>
   </include>
   <rosparam file="$(find super_lio)/config/geometry.yaml" command="load"/>
-  <param name="/lio/geometry/enable_degeneracy" value="$(arg enable)"/>
+  <param name="/lio/geometry/enable_degeneracy" value="$(eval arg('enable') or arg('spectral'))"/>
+  <param name="/lio/geometry/enable_spectral_reliability" value="$(arg spectral)"/>
   <param name="/lio/geometry/enable_bump_layer" value="$(arg enable)"/>
   <param name="/lio/geometry/enable_informed_sampling" value="$(arg enable)"/>
   <param name="/lio/geometry/enable_bump_measurement" value="$(arg enable)"/>

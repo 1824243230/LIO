@@ -1,16 +1,27 @@
 
 #include "ros/ROSWrapper.h"
 #include "lio/scan_validation.h"
+#include "lio/measurement_sync.h"
 #include "super_lio/CloudPose.h"
 #include "super_lio/CloudPose2.h"
 
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <stdexcept>
 
 using namespace BASIC;
 
 namespace LI2Sup{
 
 void LoadParamFromRos(ros::NodeHandle& nh){
+  // 关键几何参数不能用缺省零值继续运行：错误配置必须在构造地图/滤波器前退出。
+  const auto required = [&](const char* key, auto& value) {
+    if (!nh.getParam(key, value)) throw std::invalid_argument(std::string("Missing/invalid ROS parameter: ")+key);
+  };
+  const auto require_finite_array = [](const auto& values, size_t size, const char* key) {
+    if (values.size()!=size || !std::all_of(values.begin(),values.end(),
+        [](auto v) { return std::isfinite(v); }))
+      throw std::invalid_argument(std::string("Invalid extrinsic length/value: ")+key);
+  };
   nh.getParam("/lio/map/save_map", g_save_map);
   LOG(INFO) << GREEN << " ---> [Param] map/save_map: " << (g_save_map ? "true" : "false") << RESET;
   nh.getParam("/lio/map/if_filter", g_if_filter);
@@ -29,9 +40,12 @@ void LoadParamFromRos(ros::NodeHandle& nh){
   // sensor cfg
   nh.getParam("/lio/sensor/lidar_type", g_lidar_type);
   double temp_range_dis;
-  nh.getParam("/lio/sensor/blind", temp_range_dis);
+  required("/lio/sensor/blind", temp_range_dis);
+  if (!std::isfinite(temp_range_dis) || temp_range_dis < 0) throw std::invalid_argument("Invalid blind range");
   g_blind2 = temp_range_dis * temp_range_dis;
-  nh.getParam("/lio/sensor/maxrange", temp_range_dis);
+  required("/lio/sensor/maxrange", temp_range_dis);
+  if (!std::isfinite(temp_range_dis) || temp_range_dis <= std::sqrt(g_blind2))
+    throw std::invalid_argument("maxrange must exceed blind range");
   g_maxrange2 = temp_range_dis * temp_range_dis;
   nh.getParam("/lio/sensor/filter_rate", g_filter_rate);
   g_filter_rate = std::max(1, g_filter_rate);
@@ -47,13 +61,15 @@ void LoadParamFromRos(ros::NodeHandle& nh){
 
   // extrinsic
   std::vector<scalar> extrinsic_lidar_imu, extrinsic_odom_robo;
-  nh.getParam("/lio/extrinsic/lidar_imu", extrinsic_lidar_imu);      // 3 + 9
+  required("/lio/extrinsic/lidar_imu", extrinsic_lidar_imu);
+  require_finite_array(extrinsic_lidar_imu, 12, "lidar_imu"); // 平移 3 项 + 原有存储约定的旋转 9 项
   V3 __t = V3(extrinsic_lidar_imu[0], 
               extrinsic_lidar_imu[1], 
               extrinsic_lidar_imu[2]);
   M3 __R = M3(extrinsic_lidar_imu.data() + 3);
   g_lidar_imu = SE3(__R, __t);  // lidar in imu frame·
-  nh.getParam("/lio/extrinsic/odom_robo", extrinsic_odom_robo);     // 3 + 3 x,y,z,r,p,y
+  required("/lio/extrinsic/odom_robo", extrinsic_odom_robo);
+  require_finite_array(extrinsic_odom_robo, 6, "odom_robo"); // x,y,z,roll,pitch,yaw，角度单位为度
   __t = V3(extrinsic_odom_robo[0], 
            extrinsic_odom_robo[1], 
            extrinsic_odom_robo[2]);
@@ -74,7 +90,8 @@ void LoadParamFromRos(ros::NodeHandle& nh){
 
   // hash_map
   int hash_capacity;
-  nh.getParam("/lio/hash_map/hash_capacity", hash_capacity);
+  required("/lio/hash_map/hash_capacity", hash_capacity);
+  if (hash_capacity <= 0) throw std::invalid_argument("hash_capacity must be positive");
   g_ivox_capacity = hash_capacity;
   nh.getParam("/lio/hash_map/vox_resolution", g_ivox_resolution);
   
@@ -96,7 +113,8 @@ void LoadParamFromRos(ros::NodeHandle& nh){
   nh.getParam("/lio/output/ml_map",         g_2_ml_map);
   nh.getParam("/lio/output/map",    g_visual_map);
   nh.getParam("/lio/output/dense",  g_visual_dense);
-  nh.getParam("/lio/output/pub_step", g_pub_step);
+  nh.param("/lio/output/pub_step", g_pub_step, 1);
+  g_pub_step = std::max(1, g_pub_step); // 发布计数使用取模，禁止除数为零。
 
   g_update_map = false;
   nh.getParam("/lio/relocation/update_map", g_update_map);
@@ -139,44 +157,26 @@ std::tuple<float, float, float> getColorFromVelocity(float velocity, float max_v
 
 
 void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, CloudPtr& point_cloud){
+  if (!point_cloud) point_cloud.reset(new PointCloudType());
   point_cloud->clear();
-  CloudPtr cloud_full(new PointCloudType());
-  int plsize = msg->point_num;
-  cloud_full->resize(plsize);
-  point_cloud->reserve(plsize);
-  std::vector<bool> is_valid_pt(plsize, false);
-  std::vector<std::size_t> index(plsize - 1);
-  std::iota(std::begin(index), std::end(index), 1);
-
-  std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const uint &i) {
-    if((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00)
-    {
-      // if (i % g_filter_rate == 0) 
-      {
-        cloud_full->at(i).x = msg->points[i].x;
-        cloud_full->at(i).y = msg->points[i].y;
-        cloud_full->at(i).z = msg->points[i].z;
-        cloud_full->at(i).intensity = msg->points[i].reflectivity;
-
-        if ((abs(cloud_full->at(i).x - cloud_full->at(i - 1).x) > 1e-7) ||
-            (abs(cloud_full->at(i).y - cloud_full->at(i - 1).y) > 1e-7) ||
-            (abs(cloud_full->at(i).z - cloud_full->at(i - 1).z) > 1e-7))
-        {
-          double normal_dis = cloud_full->at(i).x * cloud_full->at(i).x + 
-                              cloud_full->at(i).y * cloud_full->at(i).y +
-                              cloud_full->at(i).z * cloud_full->at(i).z;
-          if(normal_dis > g_blind2 and normal_dis < g_maxrange2){
-            is_valid_pt[i] = true;
-          }
-        }
-      }
-    }
-  });
-
-  for (int i = 1; i < plsize; i++) {
-    if (is_valid_pt[i]) {
-      point_cloud->points.push_back(cloud_full->at(i));
-    }
+  // 本函数为备用无时间点云转换接口；实际 Livox 回调使用带 offset_time 的独立路径。
+  // 必须先验证声明长度，避免空包 size-1 下溢及错误长度造成越界。
+  if (!msg || msg->point_num != msg->points.size() || msg->points.size() < 2) return;
+  point_cloud->reserve(msg->points.size());
+  // 直接读不可变原消息中的相邻点，避免并行读取尚未写完的 cloud_full[i-1]。
+  // 保留原接口从第 1 点开始、按相邻坐标去重的约定，不使用 vector<bool> 并发写入。
+  for (size_t i=1; i<msg->points.size(); ++i) {
+    const auto& p=msg->points[i];
+    const auto& previous=msg->points[i-1];
+    if ((p.tag & 0x30)!=0x10 && (p.tag & 0x30)!=0x00) continue;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    if (std::abs(p.x-previous.x)<=1e-7 && std::abs(p.y-previous.y)<=1e-7 &&
+        std::abs(p.z-previous.z)<=1e-7) continue;
+    const double distance=double(p.x)*p.x+double(p.y)*p.y+double(p.z)*p.z;
+    if (distance<=g_blind2 || distance>=g_maxrange2) continue;
+    PointType point;
+    point.x=p.x; point.y=p.y; point.z=p.z; point.intensity=p.reflectivity;
+    point_cloud->push_back(point);
   }
 }
 
@@ -220,28 +220,9 @@ ROSWrapper::ROSWrapper(){
 
 
 void ROSWrapper::livoxHandler(const livox_ros_driver::CustomMsg::ConstPtr& msg){
-  if(msg->point_num < 10) return;
-  LidarData lidar_data;
-  std::size_t ptsize = msg->point_num;
-  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
-  lidar_data.pc->reserve(ptsize / g_filter_rate + 1);
-
-  double offset_time = 0.0;
-  for(std::size_t _i = 0; _i < ptsize; _i += g_filter_rate){
-    auto& pt = msg->points[_i];
-    auto tag = pt.tag & 0x30;
-    if (tag == 0x10 || tag == 0x00){
-      auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-      if(dis > g_blind2 && dis < g_maxrange2){
-        offset_time = pt.offset_time * 1e-9;
-        lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.reflectivity, offset_time);
-      }
-    }
-  }
-  lidar_data.start_time = msg->header.stamp.toSec();
-  lidar_data.end_time   = lidar_data.start_time + offset_time;
-  if (!finalizeLidarScan(lidar_data)) return;
-  lidar_buffer_.push_back(lidar_data);
+  LidarData scan;
+  if (!msg || !convertLivoxScan(*msg,g_filter_rate,g_blind2,g_maxrange2,scan)) return;
+  lidar_buffer_.push_back(std::move(scan));
 }
 
 
@@ -355,17 +336,12 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
                  msg->angular_velocity.z);
   if (!std::isfinite(data.secs) || !data.acc.allFinite() || !data.gyr.allFinite()) return;
 
-  if (data.secs < last_timestamp_imu_) {
-    LOG(WARNING) << "imu loop back, clear buffer";
-    imu_buffer_.clear();
-    imu_buffer_.push_back(data);
-    last_timestamp_imu_ = data.secs;
-    // eskf_->Reset();   // todo:
+  if (!appendImu(data,imu_buffer_,last_timestamp_imu_)) {
+    if (data.secs < last_timestamp_imu_)
+      ROS_WARN_THROTTLE(1.0, "Dropping out-of-order IMU; restart the node when replaying an earlier time range");
     return;
   }
-
-  imu_buffer_.push_back(data);
-  last_timestamp_imu_ = data.secs;
+  if (!eskf_) return;
 
   static ros::Publisher pub_imu_odom  = nh_.advertise<nav_msgs::Odometry>("/lio/imu/odom", 10);    /// imu frame -> imu freq
   static ros::Publisher pub_robo_odom = nh_.advertise<nav_msgs::Odometry>("/lio/robo/odom", 10);   /// robot frame -> imu freq
@@ -421,46 +397,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
 
 
 bool ROSWrapper::sync_measure(MeasureGroup& meas){
-  if (lidar_buffer_.empty() || imu_buffer_.empty()) {
-    return false;
-  }else{
-  }
-
-  /*** push a lidar scan ***/
-  if (!lidar_pushed_) {
-    meas.lidar = lidar_buffer_.front();
-    lidar_pushed_ = true;
-  }
-
-  if(last_timestamp_lidar_ > meas.lidar.end_time){
-    lidar_buffer_.pop_front();
-    lidar_pushed_ = false;
-    return false;
-  }
-
-  if (last_timestamp_imu_ < meas.lidar.end_time) {
-    return false;
-  }
-
-  /*** push imu_ data, and pop from imu_ buffer ***/
-  double imu_time = imu_buffer_.front().secs;
-  meas.imu.clear();
-  while ((!imu_buffer_.empty()) && (imu_time < meas.lidar.end_time)) {
-    imu_time = imu_buffer_.front().secs;
-    if (imu_time > meas.lidar.end_time) break;
-    meas.imu.push_back(imu_buffer_.front());
-    imu_buffer_.pop_front();
-  }
-  // Retain the right bracket for the next scan, but use it now to integrate
-  // exactly to this scan's end instead of stopping at the last earlier IMU.
-  if (!imu_buffer_.empty() &&
-      (meas.imu.empty() || meas.imu.back().secs < meas.lidar.end_time))
-    meas.imu.push_back(imu_buffer_.front());
-
-  last_timestamp_lidar_ = meas.lidar.end_time;
-  lidar_buffer_.pop_front();
-  lidar_pushed_ = false;
-  return true;
+  return synchronizeMeasurements(lidar_buffer_,imu_buffer_,last_timestamp_lidar_,meas);
 }
 
 
