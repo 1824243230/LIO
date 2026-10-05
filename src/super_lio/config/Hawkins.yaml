@@ -1,0 +1,59 @@
+lio:
+  map:
+    save_map: false
+    if_filter: false
+    save_map_dir: "map"
+    map_name: "hawkins_map.pcd"
+    ds_size: 0.3
+    save_interval: 500
+
+  ros:
+    # The decoder in Hawkins.launch publishes PointCloud2 here.
+    lidar_topic: "/velodyne_points"
+    imu_topic: "/imu/data"
+
+  sensor:
+    lidar_type: 3  # VELO16: PointCloud2 with float time in seconds.
+    blind: 0.4     # VLP-16 decoder minimum range; verify on decoded clouds.
+    maxrange: 100.0
+    filter_rate: 3  # Keep every third decoded point; initial tuning value.
+    enable_downsample: true
+    voxel_fliter_size: 0.5
+    gravity_norm: 9.81
+    imu_type: 0
+    # Initial filter tuning values, NOT calibrated Epson M-G365 noise values.
+    # TODO: replace with verified Hawkins IMU noise parameters before evaluation.
+    imu_na: 0.1
+    imu_ng: 0.1
+    imu_nba: 0.0001
+    imu_nbg: 0.0001
+
+  extrinsic:
+    # lidar_imu is supplied by Hawkins.launch from the official laser_to_imu
+    # calibration. Its published rotation is projected to SO(3); see the
+    # integration report. The array order is translation then Eigen column-major.
+    # odom_robo only selects an IMU-coincident auxiliary output frame here;
+    # it is not a claimed physical robot-frame calibration.
+    odom_robo: [0, 0, 0, 0, 0, 0]
+
+  hash_map:
+    hash_capacity: 1000000
+    vox_resolution: 0.5
+
+  kf:
+    kf_type: 1
+    kf_max_iterations: 4
+    kf_align_gravity: true
+    kf_quit_eps: 0.001
+
+  output:
+    robot: false
+    plan_env_world: false
+    plan_env_body: false
+    planner: false
+    map: true
+    dense: true
+    pub_step: 5
+
+  eva:
+    timer: false

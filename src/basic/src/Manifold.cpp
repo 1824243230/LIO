@@ -452,6 +452,9 @@ V4 SE3::operator*(const V4& point) const noexcept{
 void SE3::update(const V6 &dxi){
   SE3 dT(dxi);
   T_ = dT.T() * T_;
+  // 点乘和 R()/t() 使用分量缓存，左乘更新后必须与齐次矩阵同步。
+  R_ = T_.topLeftCorner<3,3>();
+  t_ = T_.topRightCorner<3,1>();
 }
 
 void SE3::updateRhs(const V6 &dxi){

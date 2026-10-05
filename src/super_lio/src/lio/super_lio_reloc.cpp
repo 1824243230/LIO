@@ -217,12 +217,9 @@ bool SuperLIOReLoc::kf_init(){
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
   kf_->SetInitialConditions(options, mean_gyro, V3::Zero(), imu_scale, ref_gravity);
-  auto state = kf_->GetSysState();
-  /// The horizontal initial state of the imu in the robot coordinate system.
-  state.R = SO3(init_guess_T.block<3, 3>(0, 0));
-  state.p = init_guess_T.block<3, 1>(0, 3);
-  state.timestamp = -1.0;
-  kf_->SetX(state, measures_.imu.back());
+  // 注册得到的位姿与当前 IMU 一起提交，不能再用旧版的 -1 时间哨兵。
+  kf_->SetPoseAtImu(SE3(SO3(init_guess_T.block<3,3>(0,0)),
+                       init_guess_T.block<3,1>(0,3)), measures_.imu.back());
   sys_init_pose_ = kf_->GetSE3();
 
   {

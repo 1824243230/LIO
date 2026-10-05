@@ -99,6 +99,12 @@ target_link_libraries(relocation_node
 )
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(stationary_imu_init_test tests/stationary_imu_init_test.cpp)
+  target_link_libraries(stationary_imu_init_test lio)
+  add_test(NAME stationary_imu_init COMMAND stationary_imu_init_test)
+  add_executable(octvox_review_test tests/octvox_review_test.cpp)
+  target_link_libraries(octvox_review_test lio)
+  add_test(NAME octvox_review COMMAND octvox_review_test)
   add_executable(map_io_test tests/map_io_test.cpp)
   target_link_libraries(map_io_test lio)
   add_test(NAME map_io COMMAND map_io_test)

@@ -26,6 +26,30 @@ class Harness : public SuperLIO {
   }
 };
 int main() {
+  // 机体朝世界 +Y，但沿世界 +X 运动：ROS 子坐标系中的速度应为 -Y。
+  // 同时验证两条实际发布路径共用的消息构造，不需要启动 ROS master。
+  NavState nav;
+  nav.timestamp=42.125;
+  nav.R=SO3(M3(Eigen::AngleAxis<scalar>(M_PI/2, V3::UnitZ())));
+  nav.p=V3(4,5,6); nav.v=V3(2,0,0);
+  const auto low_rate=makeImuOdometry(nav);
+  check(low_rate.header.frame_id=="world" && low_rate.child_frame_id=="body" &&
+        low_rate.header.stamp.toSec()==nav.timestamp, "odometry declares both frames and state timestamp");
+  check(low_rate.pose.pose.position.x==4 && low_rate.pose.pose.position.y==5 &&
+        low_rate.pose.pose.position.z==6, "odometry pose remains in world frame");
+  check(std::abs(low_rate.twist.twist.linear.x)<1e-6 &&
+        std::abs(low_rate.twist.twist.linear.y+2)<1e-6,
+        "world velocity rotates to the declared child frame");
+  DynamicState dynamic(nav.timestamp,nav.R.R_,nav.p,nav.v,V3(.1,.2,.3),V3::Zero());
+  const auto high_rate=makeImuOdometry(dynamic);
+  check(high_rate.header==low_rate.header && high_rate.child_frame_id==low_rate.child_frame_id &&
+        high_rate.pose.pose==low_rate.pose.pose && high_rate.twist.twist.linear==low_rate.twist.twist.linear,
+        "IMU and LiDAR rate odometry use the same frame convention");
+  check(std::abs(high_rate.twist.twist.angular.x-.1)<1e-6 &&
+        std::abs(high_rate.twist.twist.angular.y-.2)<1e-6 &&
+        std::abs(high_rate.twist.twist.angular.z-.3)<1e-6,
+        "body angular velocity is preserved without another rotation");
+
   g_blind2=0; g_maxrange2=100;
   auto msg=boost::make_shared<livox_ros_driver::CustomMsg>();
   CloudPtr cloud;

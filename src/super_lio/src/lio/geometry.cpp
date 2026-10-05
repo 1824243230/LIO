@@ -13,7 +13,7 @@ bool Options::valid(double size) const {
 #include "lio/geometry_options.def"
 #undef GOPT
   return size > 0 && std::isfinite(size) && rotation_length_scale > 0 &&
-    spectral_full_ratio > 0 && spectral_full_ratio <= 1 &&
+    spectral_full_ratio > 0 && spectral_full_ratio <= 1 && plane_huber_delta >= 0 &&
     (!enable_spectral_reliability || enable_degeneracy) &&
     degeneracy_ratio_enter_degenerate > 0 &&
     degeneracy_ratio_enter_degenerate < degeneracy_ratio_exit_degenerate &&
@@ -27,7 +27,8 @@ bool Options::valid(double size) const {
     bump_plane_reproject_angle_deg > 0 && bump_plane_reproject_angle_deg < 90 &&
     bump_range_weight_max > 0 && bump_range_epsilon > 0 &&
     fine_resolution > 0 && coarse_resolution >= fine_resolution &&
-    informed_top_k_voxels > 0 && max_bump_constraints > 0 && mid_threshold >= 0 &&
+    informed_top_k_voxels > 0 && max_bump_constraints > 0 && max_bumps_per_voxel >= 0 &&
+    mid_threshold >= 0 &&
     bump_min_mid >= 0 && bump_min_gradient > 0 && bump_min_pixel_confidence > 0 &&
     bump_min_weak_score > 0 && weak_direction_score_threshold >= 0 &&
     weak_direction_score_threshold <= 1 && bump_mid_scale > 0 && bump_gradient_scale > 0 &&
@@ -270,9 +271,13 @@ double BumpMap::mid(const V3& p) const {
 bool BumpMap::query(const V3& p, Surface& out) const {
   out = Surface{};
   if (!p.allFinite() || p.cwiseAbs().maxCoeff()/size_ > 1e8) return false;
-  auto it = cells_.find(key(p));
+  const Key voxel_key = key(p);
+  auto it = cells_.find(voxel_key);
   if (it == cells_.end() || !it->second.geom.plane_valid || !it->second.layer) return false;
-  return it->second.layer->query(p, out);
+  if (!it->second.layer->query(p, out)) return false;
+  out.voxel_key = voxel_key;
+  out.has_voxel_key = true;
+  return true;
 }
 bool BumpLayer::query(const V3& p, Surface& out) const {
   out = Surface{};
@@ -311,6 +316,7 @@ V6 poseJacobian(const V3& body, const M3& rotation, const V3& normal) {
 void selectWeakDirectionConstraints(std::vector<Candidate>& candidates,
                                     const DegeneracyResult& d, const Options& o) {
   if (!d.valid || d.status == Status::NORMAL || o.max_bump_constraints <= 0 ||
+      o.max_bumps_per_voxel < 0 ||
       !std::isfinite(o.weak_direction_score_threshold)) { candidates.clear(); return; }
   candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const Candidate& c) {
     return !std::isfinite(c.quality) || c.quality <= o.weak_direction_score_threshold || c.quality > 1 ||
@@ -321,9 +327,15 @@ void selectWeakDirectionConstraints(std::vector<Candidate>& candidates,
     return a.quality != b.quality ? a.quality > b.quality : a.index < b.index;
   });
   std::set<size_t> indices;
+  std::map<Key, int> accepted_by_voxel;
   size_t count = 0;
   for (const auto& c : candidates) {
-    if (!indices.insert(c.index).second) continue;
+    if (indices.count(c.index)) continue;
+    if (o.max_bumps_per_voxel > 0 && c.has_voxel_key &&
+        accepted_by_voxel[c.voxel_key] >= o.max_bumps_per_voxel) continue;
+    indices.insert(c.index);
+    if (o.max_bumps_per_voxel > 0 && c.has_voxel_key)
+      ++accepted_by_voxel[c.voxel_key];
     candidates[count++] = c;
     if (count == size_t(o.max_bump_constraints)) break;
   }
@@ -427,6 +439,8 @@ bool candidate(const Surface& s, const V3& body, const M3& rotation,
     c.variance = o.sigma_b_base*o.sigma_b_base/c.robust_weight;
   }
   c.residual = s.residual; c.mid = s.mid; c.gradient = s.gradient;
+  c.voxel_key = s.voxel_key;
+  c.has_voxel_key = s.has_voxel_key;
   return std::isfinite(c.variance) && c.variance > 0;
 }
 } }

@@ -48,6 +48,10 @@ std::tuple<float, float, float> getColorFromVelocity(float velocity, float max_v
 
 void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, BASIC::CloudPtr& point_cloud);
 
+// IMU 位姿以 world 表达；Odometry 的 twist 必须以 child_frame_id（body）表达。
+nav_msgs::Odometry makeImuOdometry(const NavState& state);
+nav_msgs::Odometry makeImuOdometry(const DynamicState& state);
+
 class ROSWrapper{
 public:
   ROSWrapper();
@@ -99,6 +103,8 @@ private:
   ros::CallbackQueue self_queue_;
   ros::Subscriber subLidar_;
   ros::Subscriber subIMU_;
+  // Hawkins only: reject clouds without the decoder's per-point time field.
+  bool hawkins_input_ = false;
   std::deque<IMUData>   imu_buffer_;
   std::deque<LidarData> lidar_buffer_;
   double last_timestamp_imu_ = -1.0;

@@ -10,6 +10,31 @@ using namespace LI2Sup;
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
 int main() {
+  const M3 initial_rotation = SO3::Exp(V3(0.2f, -0.1f, 0.3f)).R_;
+  const V3 initial_translation(1.0f, -2.0f, 0.5f), test_point(0.4f, -0.2f, 1.5f);
+  const SE3 initial_pose(initial_rotation, initial_translation);
+  const M4 initial_matrix = initial_pose.matrix();
+  // Eigen 表达式会走模板构造器；矩阵与分量缓存必须表示同一个变换。
+  const SE3 expression_pose(initial_matrix * M4::Identity());
+  check(expression_pose.R().allFinite() && expression_pose.t().allFinite() &&
+        (expression_pose.matrix()-initial_matrix).norm()<1e-6 &&
+        (expression_pose.R()-initial_rotation).norm()<1e-6 &&
+        (expression_pose.t()-initial_translation).norm()<1e-6 &&
+        (expression_pose*test_point-initial_pose*test_point).norm()<1e-6,
+        "SE3 matrix-expression construction initializes rotation and translation caches");
+
+  SE3 updated_pose = initial_pose;
+  V6 increment; increment << 0.08f, -0.04f, 0.12f, 0.2f, -0.3f, 0.5f;
+  const M4 expected_matrix = SE3(increment).matrix()*initial_matrix;
+  updated_pose.update(increment);
+  const V3 expected_point = expected_matrix.topLeftCorner<3,3>()*test_point+
+                            expected_matrix.topRightCorner<3,1>();
+  check((updated_pose.matrix()-expected_matrix).norm()<1e-6 &&
+        (updated_pose.R()-expected_matrix.topLeftCorner<3,3>()).norm()<1e-6 &&
+        (updated_pose.t()-expected_matrix.topRightCorner<3,1>()).norm()<1e-6 &&
+        (updated_pose*test_point-expected_point).norm()<1e-6,
+        "SE3 left update keeps matrix, rotation, translation and point transforms consistent");
+
   LidarData scan;
   scan.start_time=10;
   scan.pc.reset(new pcl::PointCloud<PointXTZIT>());

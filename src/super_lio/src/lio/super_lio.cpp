@@ -24,6 +24,11 @@ inline bool compute_error(
 
 
 void SuperLIO::init(){
+  ros::NodeHandle nh;
+  nh.param("/lio/imu_init/require_stationary", require_stationary_init_, false);
+  nh.param("/lio/imu_init/enable_zupt", enable_zupt_, false);
+  ROS_INFO_STREAM("IMU stationary-window initialization: " << require_stationary_init_);
+  ROS_INFO_STREAM("IMU zero-velocity update: " << enable_zupt_);
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
   kf_.reset(new ESKF());
   InitGeometry();
@@ -70,19 +75,46 @@ void SuperLIO::process(){
   if(!data_wrapper_->sync_measure(measures_)){
     return;
   }
+  if (enable_zupt_) {
+    // The synchronizer lends an IMU sample beyond the scan end. Only use
+    // measurements already available at this state time; add() deduplicates
+    // the borrowed sample when it appears in the next scan.
+    for (const auto& imu : measures_.imu)
+      if (imu.secs <= measures_.lidar.end_time) zupt_imu_window_.add(imu);
+  }
   (this->*state_fn_)();
 }
 
 
 bool SuperLIO::kf_init(){
   if (measures_.imu.empty()) return false;
-  for (const auto& imu : measures_.imu) imu_initialization_.add(imu);
-  const auto& mean_gyro = imu_initialization_.mean_gyro;
-  const auto& mean_acce = imu_initialization_.mean_acc;
+  for (const auto& imu : measures_.imu) {
+    imu_initialization_.add(imu);
+    if (require_stationary_init_) stationary_imu_window_.add(imu);
+  }
 
   /// 100 Hz for 1 second.
   if(imu_initialization_.count < 50){
     return false;
+  }
+
+  V3 mean_gyro = imu_initialization_.mean_gyro;
+  V3 mean_acce = imu_initialization_.mean_acc;
+  if (require_stationary_init_) {
+    const auto estimate = stationary_imu_window_.estimate();
+    if (!estimate.ready) {
+      // In a run without a quiet interval, keep waiting instead of fabricating
+      // a gyro bias from motion. The optional mode will produce no odometry.
+      ROS_WARN_THROTTLE(5.0, "Waiting for a 1 s stationary IMU window before LIO initialization");
+      return false;
+    }
+    mean_gyro = estimate.mean_gyro;
+    mean_acce = estimate.mean_acc;
+    ROS_INFO_STREAM("Stationary IMU initialization: " << estimate.count
+                    << " samples in " << estimate.duration << " s; gyro bias="
+                    << mean_gyro.transpose() << "; gyro std="
+                    << estimate.std_gyro.transpose() << "; acc std="
+                    << estimate.std_acc.transpose());
   }
 
   // 零加速度均值无法确定重力方向，继续等待数据，避免归一化产生 NaN。
@@ -111,11 +143,8 @@ bool SuperLIO::kf_init(){
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
   kf_->SetInitialConditions(options, mean_gyro, V3::Zero(), imu_scale, ref_gravity);
-  auto state = kf_->GetSysState();
-  state.R = SO3(rot);
-  state.p = g_odom_robo.t_;        // By default, the robot frame is used as the reference origin.
-  state.timestamp = measures_.imu.back().secs;
-  kf_->SetX(state, measures_.imu.back());
+  // 初始平移沿用机器人参考原点约定；时间由 IMU 锚点统一设置。
+  kf_->SetPoseAtImu(SE3(SO3(rot), g_odom_robo.t_), measures_.imu.back());
   sys_init_pose_ = kf_->GetSE3();
   return true;
 }
@@ -157,15 +186,46 @@ void SuperLIO::stateProcess(){
   if(g_time_eva){
     time_record_.Evaluate([this]() { DownSample(); }, "DownSample");
     time_record_.Evaluate([this]() { Observe(); }, "Observe");
+    if (enable_zupt_) MaybeApplyZupt();
     if (observation_valid_) time_record_.Evaluate([this]() { UpdateMap(); }, "UpdateMap");
   }else{
     DownSample();
     Observe();
+    if (enable_zupt_) MaybeApplyZupt();
     if (observation_valid_) UpdateMap();
   }
   PublishGeometry();
   Output();
   if (observation_valid_) caceData();
+}
+
+bool SuperLIO::MaybeApplyZupt() {
+  if (!enable_zupt_ || !kf_) return false;
+  const auto estimate = zupt_imu_window_.estimate();
+  const auto velocity = kf_->GetNavState().v;
+  const bool stationary = estimate.ready && estimate.mean_acc.allFinite() &&
+    std::isfinite(g_gravity_norm) &&
+    std::abs(double(estimate.mean_acc.norm())-g_gravity_norm) <= 0.5 &&
+    velocity.allFinite() && velocity.norm() < 0.25;
+  const bool applied = stationary && kf_->UpdateZeroVelocity();
+  if (applied) {
+    if (!zupt_active_)
+      ROS_INFO_STREAM("ZUPT active at t=" << kf_->GetTime()
+                      << ": stationary IMU window, velocity=" << velocity.norm() << " m/s");
+    ++zupt_streak_;
+    ++zupt_total_;
+    if (zupt_streak_ % 100 == 0)
+      ROS_INFO_STREAM("ZUPT active: " << zupt_streak_ << " frames in this interval, "
+                      << zupt_total_ << " total");
+  } else if (zupt_active_) {
+    ROS_INFO_STREAM("ZUPT ended at t=" << kf_->GetTime() << ": " << zupt_streak_
+                    << " frames in this interval, " << zupt_total_ << " total");
+    zupt_streak_ = 0;
+  }
+  zupt_active_ = applied;
+  // observation_valid_ remains the LiDAR result. ZUPT must never authorize
+  // insertion of a scan whose LiDAR update failed.
+  return applied;
 }
 
 
@@ -280,7 +340,14 @@ void SuperLIO::AnalyzeSamplingGeometry() {
       const Eigen::Vector3d nb = pose.R_.cast<double>().transpose()*J.tail<3>();
       variance += std::max(0.0, nb.dot(it->second*nb));
     }
-    G += J * J.transpose()/variance;
+    if (!std::isfinite(variance) || variance <= 0) continue;
+    if (geometry_options_.plane_huber_delta > 0) {
+      const double robust_weight = geometry::huberWeight(residual, geometry_options_.plane_huber_delta);
+      if (robust_weight <= 0) continue;
+      G += J * (robust_weight/variance) * J.transpose();
+    } else {
+      G += J * J.transpose()/variance;
+    }
   }
   degeneracy_ = geometry_analyzer_.analyze(G, geometry_options_, true);
   sampling_geometry_analyzed_ = true;
@@ -395,7 +462,15 @@ void SuperLIO::Observe(bool plane_only){
             double variance = 0.001;
             if (uncertainty_motion_)
               variance += std::max(0.0, nb.dot(sampled_covariances[idx]*nb));
-            plane_precisions[idx] = 1.0/variance;
+            const double robust_weight = geometry_options_.plane_huber_delta > 0
+                ? geometry::huberWeight(error, geometry_options_.plane_huber_delta) : 1.0;
+            if (robust_weight <= 0 || !std::isfinite(variance) || variance <= 0) {
+              effect_mask_[idx] = false;
+              continue;
+            }
+            // The same effective precision must be removed if a bump replaces
+            // this plane row later in the iteration.
+            plane_precisions[idx] = robust_weight/variance;
             local_acc.HTVH += J * plane_precisions[idx] * J.transpose();
             local_acc.HTVr -= J * plane_precisions[idx] * error;
           }

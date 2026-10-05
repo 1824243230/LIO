@@ -64,3 +64,42 @@ source /home/hyh/rong_ws/Super-LIO/devel/setup.bash
 catkin_make -C /home/hyh/rong_ws/Super-LIO -j2 -l2
 ctest --test-dir /home/hyh/rong_ws/Super-LIO/build --output-on-failure
 ```
+
+## 提交 c82828e 后的再次复核（2026-10-01）
+
+本次从干净工作区开始，重点复核此前修复的调用端及核心点地图。
+
+1. **重定位初始化时间回归。** 前一轮增加 `SetX(state, imu)` 的同时间校验后，重定位成功分支仍将 `state.timestamp` 写为旧哨兵 `-1`。正常 IMU 时间不为 -1，因而配准成功后反而抛异常。现将建图/重定位统一到 `SetPoseAtImu`，使用真实 IMU 时间并保留已估计的偏置；继续严格校验时间，不放宽验证来绕过问题。
+2. **主体素容量提前淘汰。** 插入后 `size >= capacity` 会只保留 capacity-1 格，容量为 1 时地图始终为空。改为只有超过容量才淘汰；验证最近使用顺序和精确容量边界。
+3. **近邻搜索停止阈值未随分辨率缩放。** `orders_min_dis2` 以 0.5 m 主体素为基准，直接作为所有配置的米制距离平方，会在小分辨率下过早结束查询。现在按 `(resolution / 0.5)^2` 缩放；原 0.5 m 配置的阈值不变。
+4. **默认地图参数内部不一致。** 默认 `resolution=0.5`、`inv_resolution=1`，使备用 `getTopK_VN` 查询与插入使用不同索引。倒数改为 2，并拒绝零容量以及非正、非有限或倒数溢出的分辨率。
+
+新增 `octvox_review` 在修复前实际失败，复现容量 1/2 的错误和 0.1 m 近邻结果偏离穷举结果。
+修复后的测试覆盖 0.1/0.25/0.5/1.0 m 搜索、LRU 保留顺序、默认 VN 查询和非法配置。
+`logic_review` 增加两个生产调用端共用的初始化入口测试：位姿/时间/偏置传递、首段 IMU 积分、时间不匹配仍被原子拒绝。
+
+这覆盖初始化状态交接，没有执行 NDT/ICP 配准及 ROS 回调的端到端重定位实验；也未回放数据集。
+
+本次最终结果：完整 `catkin_make -j2 -l2` 编译成功，13 项 CTest 全部通过，`git diff --check` 通过。修复前后使用同一近邻/容量用例，没有放宽断言；原有 12 项回归测试继续通过。链接器仍有既有 PCL 1.10/1.12 混链提示。
+
+## 继续复核：地图边界、SE(3) 一致性及 ROS 输出（2026-10-05）
+
+在上一节未提交修改上继续完成以下修复，并补充对应代码注释：
+
+1. **地图索引转整数越界。** 有限的大坐标或极小体素也可能让缩放后的坐标超出 `int` 范围。插入、分组近邻和 VN 查询现在共用经过范围校验的子体素索引；拒绝 NaN、Inf 和超界值，避免浮点转整数的未定义行为。检查在 double 中比较整数边界，保留原有 float 缩放规则，防止 `INT_MAX` 舍入到 `2^31`。主体素键由子体素键除以 2 得到，给邻居偏移保留整数范围。
+2. **清图残留禁写状态。** `resetMap` 原来会保留上一张地图的插入倒计时，连续替换地图会清空旧地图却跳过新地图插入。`clear` 现在同时清理倒计时和标记。该问题属于地图接口，当前里程计主路径没有调用 `resetMap`，不能当作已证实的轨迹误差根因。
+3. **SE(3) 的矩阵与分量缓存不一致。** Eigen 表达式构造原来只写 `T_`，左乘 `update` 也没有同步 `R_`、`t_`，导致同一个对象的齐次矩阵运算与三维点变换不同。现在模板构造委托固定矩阵构造器，左更新同步分量缓存。覆盖非平凡旋转和平移；当前滤波核心没有调用这个左更新接口。
+4. **IMU 里程计速度混用坐标系。** `/lio/odom` 和 `/lio/imu/odom` 原来直接发布世界系线速度，且缺少 `child_frame_id`；高频角速度却在 IMU 系。依照本机 `nav_msgs/Odometry.msg` 的定义，两条路径现在共用消息构造，声明 `world`/`body`，将线速度转换为 `R.transpose()*v`，高频角速度保持 body 表达。历史 Path 中每个位姿同时补齐各自的时间和坐标系。
+
+兼容性：依赖上述两个里程计话题线速度的下游应按 body 系解释 `twist.linear`。
+`pose` 仍表达世界系位姿，因此基于 pose 的 TUM 轨迹记录不需要修改。
+本次未补齐 `/lio/robo/odom` 的速度估计，也没有新增 TF 广播；它仍仅提供已有的机器人位姿输出。
+
+回归覆盖：`octvox_review` 增加连续换图、clear 后插入、非法插入不淘汰有效地图、两种查询的整数边界及极小分辨率；
+`lio_numerics` 增加矩阵表达式构造和左乘更新的一致性；`input_review` 增加 90 度航向下的速度转换和两条实际消息构造路径一致性。
+启动参数解析确认 `enable=false spectral=false smooth=true uamc=true` 只开启两项运动补偿，几何和谱增强均关闭。
+
+最终验证：完整 `catkin_make -j2 -l2` 成功，13 项 CTest 全部通过（0.72 s），`git diff --check` 通过。
+`octvox_review_test.cpp` 另以 `-fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=all` 独立编译执行，通过且无诊断。
+构建及测试日志分别为 `/tmp/lio_review_resume_build.log`、`/tmp/lio_review_resume_tests.log`；sanitizer 日志为 `/tmp/lio_octvox_ubsan.log`。
+链接器仍有既有 PCL 1.10/1.12 混链提示。未启动 ROS 节点或进行数据集回放，没有本轮 ATE/RPE 对比结果。

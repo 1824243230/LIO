@@ -45,6 +45,7 @@ protected:
   void stateWaitKFInit();
   void stateWaitMapInit();
   void stateProcess();
+  bool MaybeApplyZupt();
   virtual bool kf_init();
   virtual bool map_init();
   bool Propagation_Undistort();
@@ -71,6 +72,13 @@ protected:
   MeasureGroup measures_;
   
   ImuInitialization imu_initialization_;
+  StationaryImuWindow stationary_imu_window_;
+  StationaryImuWindow zupt_imu_window_;
+  bool require_stationary_init_ = false;
+  bool enable_zupt_ = false;
+  bool zupt_active_ = false;
+  size_t zupt_streak_ = 0;
+  size_t zupt_total_ = 0;
   bool flg_init_ = false;
   bool flg_first_scan_ = true;
   std::vector<DynamicState> propagate_states_;

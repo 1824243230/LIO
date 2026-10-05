@@ -51,6 +51,8 @@ int main() {
   // The same prepared surface must remain unused while the analyzer reports NORMAL.
   Surface prepared;
   check(surface.query(V3(0.2213,0.2337,0.2),prepared), "prepared map query before activation");
+  check(prepared.has_voxel_key && prepared.voxel_key==surface.key(V3(0.2213,0.2337,0.2)),
+        "prepared surface carries its map voxel");
   Analyzer analyzer;
   auto normal=analyzer.analyze(M6::Identity(),o,true);
   Options gates=o;
@@ -64,6 +66,8 @@ int main() {
   auto weak=analyzer.analyze(weak_info,o,true);
   check(candidate(prepared,probe,M3::Identity(),weak,gates,measurement,diagnostics),
         "prepared historical layer can activate after degeneracy");
+  check(measurement.has_voxel_key && measurement.voxel_key==prepared.voxel_key,
+        "map voxel identity reaches accepted candidate");
   check(!candidate(prepared,probe,M3::Identity(),DegeneracyResult{},gates,measurement,diagnostics),
         "invalid analysis never activates prepared layer");
 

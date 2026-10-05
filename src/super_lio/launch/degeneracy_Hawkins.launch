@@ -1,0 +1,56 @@
+<launch>
+  <arg name="rviz" default="true"/>
+  <arg name="decode_packets" default="true"/>
+  <arg name="velodyne_calibration" default="$(find velodyne_pointcloud)/params/VLP16db.yaml"/>
+  <arg name="stationary_init" default="false"/>
+  <arg name="imu_ng" default="0.1"/>
+  <arg name="imu_na" default="0.1"/>
+  <arg name="imu_nbg" default="0.0001"/>
+  <arg name="imu_nba" default="0.0001"/>
+  <arg name="filter_rate" default="3"/>
+  <arg name="voxel_leaf" default="0.5"/>
+  <arg name="plane_huber_delta" default="0.0"/>
+  <!-- enable controls detection, bump map, informed sampling and bump measurement;
+       spectral also requires detection. All five requested extensions are on by default. -->
+  <arg name="enable" default="true"/>
+  <arg name="spectral" default="true"/>
+  <!-- Independent switches allow repeatable long-corridor ablations. -->
+  <arg name="bump_layer" default="$(arg enable)"/>
+  <arg name="sampling" default="$(arg enable)"/>
+  <arg name="measurement" default="$(arg enable)"/>
+  <arg name="spectral_full_ratio" default="0.02"/>
+  <arg name="max_bump_constraints" default="200"/>
+  <arg name="max_bumps_per_voxel" default="0"/>
+  <arg name="csv_path" default=""/>
+
+  <!-- Reuse the verified Hawkins topics, VLP-16 decoder, IMU settings and extrinsic. -->
+  <include file="$(find super_lio)/launch/Hawkins.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="decode_packets" value="$(arg decode_packets)"/>
+    <arg name="velodyne_calibration" value="$(arg velodyne_calibration)"/>
+    <arg name="stationary_init" value="$(arg stationary_init)"/>
+    <arg name="imu_ng" value="$(arg imu_ng)"/>
+    <arg name="imu_na" value="$(arg imu_na)"/>
+    <arg name="imu_nbg" value="$(arg imu_nbg)"/>
+    <arg name="imu_nba" value="$(arg imu_nba)"/>
+    <arg name="filter_rate" value="$(arg filter_rate)"/>
+    <arg name="voxel_leaf" value="$(arg voxel_leaf)"/>
+    <arg name="plane_huber_delta" value="$(arg plane_huber_delta)"/>
+  </include>
+
+  <!-- As in degeneracy_M2DGR.launch, load shared geometry tuning before
+       overriding its disabled defaults. roslaunch sets parameters before nodes start. -->
+  <rosparam file="$(find super_lio)/config/geometry.yaml" command="load"/>
+  <param name="/lio/geometry/enable_degeneracy" value="$(eval arg('enable') or arg('spectral'))"/>
+  <param name="/lio/geometry/enable_spectral_reliability" value="$(arg spectral)"/>
+  <param name="/lio/geometry/enable_bump_layer" value="$(arg bump_layer)"/>
+  <param name="/lio/geometry/enable_informed_sampling" value="$(arg sampling)"/>
+  <param name="/lio/geometry/enable_bump_measurement" value="$(arg measurement)"/>
+  <param name="/lio/geometry/spectral_full_ratio" value="$(arg spectral_full_ratio)"/>
+  <param name="/lio/geometry/max_bump_constraints" value="$(arg max_bump_constraints)"/>
+  <param name="/lio/geometry/max_bumps_per_voxel" value="$(arg max_bumps_per_voxel)"/>
+  <param name="/lio/geometry/plane_huber_delta" value="$(arg plane_huber_delta)"/>
+  <!-- Degeneracy by itself does not justify a smaller bump variance. -->
+  <param name="/lio/geometry/bump_degenerate_variance_factor" value="1.0"/>
+  <param name="/lio/geometry/csv_path" value="$(arg csv_path)"/>
+</launch>

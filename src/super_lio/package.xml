@@ -23,6 +23,9 @@
   <run_depend>sensor_msgs</run_depend>
   <run_depend>visualization_msgs</run_depend>
   <run_depend>pcl_ros</run_depend>
+  <!-- Hawkins.launch decodes bagged VelodyneScan packets via a nodelet. -->
+  <run_depend>nodelet</run_depend>
+  <run_depend>velodyne_pointcloud</run_depend>
   
   <build_depend>message_generation</build_depend>
   <run_depend>message_generation</run_depend>

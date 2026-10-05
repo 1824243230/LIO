@@ -1,0 +1,21 @@
+<launch>
+  <!-- Validated on Hawkins Long Corridor with full /lio/odom APE evaluation.
+       Keep the original Hawkins.launch defaults available for comparison. -->
+  <arg name="rviz" default="true"/>
+  <arg name="decode_packets" default="true"/>
+  <arg name="velodyne_calibration" default="$(find velodyne_pointcloud)/params/VLP16db.yaml"/>
+
+  <include file="$(find super_lio)/launch/Hawkins.launch">
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="decode_packets" value="$(arg decode_packets)"/>
+    <arg name="velodyne_calibration" value="$(arg velodyne_calibration)"/>
+    <arg name="stationary_init" value="true"/>
+    <arg name="filter_rate" value="1"/>
+    <arg name="voxel_leaf" value="0.5"/>
+    <arg name="imu_ng" value="0.001"/>
+    <arg name="imu_na" value="0.01"/>
+    <arg name="imu_nbg" value="0.0001"/>
+    <arg name="imu_nba" value="0.0001"/>
+    <arg name="plane_huber_delta" value="0.0"/>
+  </include>
+</launch>

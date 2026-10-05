@@ -37,6 +37,8 @@ class Analyzer {
 struct Surface {
   double residual = 0, mid = 0, gradient = 0, confidence = 0;
   V3 normal = V3::Zero(); // d residual / d world point; includes height gradient
+  Key voxel_key{};
+  bool has_voxel_key = false; // Only BumpMap queries carry a spatial identity.
 };
 // Statistics describe the bounded retained history, not an unbounded lifetime count.
 struct VoxelGeometryStats {
@@ -93,6 +95,8 @@ V6 poseJacobian(const V3& body, const M3& rotation, const V3& normal);
 struct Candidate {
   size_t index = 0;
   V6 J = V6::Zero();
+  Key voxel_key{};
+  bool has_voxel_key = false;
   double residual = 0, quality = 0, variance = 0, weak_score = 0;
   double mid = 0, gradient = 0;
   double w_mid = 0, w_grad = 0, w_pixel = 0, w_weak = 0;
@@ -100,6 +104,7 @@ struct Candidate {
   double degeneracy_severity = 0, variance_factor = 1;
 };
 // Strict quality threshold followed by deterministic Top-K of unique point indices.
+// Optional per-voxel cap applies only to map-backed candidates with a voxel key.
 void selectWeakDirectionConstraints(std::vector<Candidate>& candidates,
                                     const DegeneracyResult& degeneracy, const Options& options);
 // Replaces only final selected rows. Filters invalid/duplicate candidates in place.

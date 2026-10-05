@@ -1,5 +1,6 @@
 #include "lio/ESKF.h"
 #include "lio/motion_uncertainty.h"
+#include <cmath>
 #include <stdexcept>
 
 using namespace BASIC;
@@ -109,6 +110,16 @@ void ESKF::SetX(const SysState& x, const IMUData& imu) {
   SetX(x);
   last_imu_ = forward_last_imu_ = imu;
   last_imu_time_ = forward_time_ = imu.secs;
+}
+
+void ESKF::SetPoseAtImu(const SE3& pose, const IMUData& imu) {
+  if (!pose.R_.allFinite() || !pose.t_.allFinite())
+    throw std::invalid_argument("initial pose must be finite");
+  auto state = GetSysState();
+  state.R = SO3(pose.R_);
+  state.p = pose.t_;
+  state.timestamp = imu.secs;
+  SetX(state, imu); // 保留已初始化的速度/偏置，并同步主、高频两条传播的锚点。
 }
 
 void ESKF::BuildNoise(const Options& options) {
@@ -430,6 +441,56 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs, std::function<bool(const STATE&)> co
 
   dx_.setZero();
 
+  last_obs_time_ = current_obs_time_;
+  return true;
+}
+
+bool ESKF::UpdateZeroVelocity(double velocity_std) {
+  const ESKF prior = *this;
+  const auto reject = [&]() { *this = prior; return false; };
+  if (!std::isfinite(velocity_std) || velocity_std <= 0 || !v_.allFinite() ||
+      !P_.allFinite()) return reject();
+
+  using D18 = Eigen::Matrix<double, 18, 18>;
+  using D18x3 = Eigen::Matrix<double, 18, 3>;
+  const D18 covariance = (0.5 * (P_ + P_.transpose())).cast<double>();
+  if (!covariance.allFinite() || Eigen::LLT<D18>(covariance).info() != Eigen::Success)
+    return reject();
+  const double variance = velocity_std * velocity_std;
+  if (!std::isfinite(variance) || variance <= 0) return reject();
+
+  // H selects world-frame velocity (state indices 6..8). The complete gain
+  // preserves corrections to pose, biases and gravity through prior covariance.
+  const D18x3 PHt = covariance.block<18,3>(0,6);
+  Eigen::Matrix3d innovation_covariance = covariance.block<3,3>(6,6);
+  innovation_covariance.diagonal().array() += variance;
+  Eigen::LLT<Eigen::Matrix3d> innovation_factor(innovation_covariance);
+  if (innovation_factor.info() != Eigen::Success) return reject();
+  const D18x3 K = innovation_factor.solve(PHt.transpose()).transpose();
+  const Eigen::Matrix<double,18,1> correction = -K * v_.cast<double>();
+  if (!K.allFinite() || !correction.allFinite()) return reject();
+
+  // Joseph form remains symmetric and positive under finite-precision updates.
+  D18 I_KH = D18::Identity();
+  I_KH.block<18,3>(0,6) -= K;
+  D18 posterior = I_KH * covariance * I_KH.transpose() + variance * K * K.transpose();
+  D18 reset = D18::Identity();
+  const V3 rotation_correction = correction.head<3>().cast<scalar>();
+  reset.block<3,3>(0,0) =
+    (M3::Identity() - 0.5 * SO3::hat(rotation_correction)).cast<double>();
+  posterior = reset * posterior * reset.transpose();
+  posterior = (0.5 * (posterior + posterior.transpose())).eval();
+  if (!posterior.allFinite() || Eigen::LLT<D18>(posterior).info() != Eigen::Success)
+    return reject();
+
+  dx_ = correction.cast<scalar>();
+  P_ = posterior.cast<scalar>();
+  if (!dx_.allFinite() || !P_.allFinite() ||
+      Eigen::LLT<COV>(P_).info() != Eigen::Success) return reject();
+  Update();
+  if (!R_.R_.allFinite() || !p_.allFinite() || !v_.allFinite() ||
+      !bg_.allFinite() || !ba_.allFinite() || !g_.allFinite()) return reject();
+  dx_.setZero();
   last_obs_time_ = current_obs_time_;
   return true;
 }

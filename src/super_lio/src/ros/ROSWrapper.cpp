@@ -12,6 +12,41 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+nav_msgs::Odometry makeImuOdometry(const NavState& state) {
+  nav_msgs::Odometry odom;
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "body";
+  odom.header.stamp.fromSec(state.timestamp);
+  odom.pose.pose.position.x = state.p.x();
+  odom.pose.pose.position.y = state.p.y();
+  odom.pose.pose.position.z = state.p.z();
+  const Quat q = state.R.quaternion().normalized();
+  odom.pose.pose.orientation.x = q.x();
+  odom.pose.pose.orientation.y = q.y();
+  odom.pose.pose.orientation.z = q.z();
+  odom.pose.pose.orientation.w = q.w();
+  // ESKF 保存世界系速度；ROS Odometry 规定线/角速度均使用子坐标系。
+  const V3 body_velocity = state.R.R_.transpose() * state.v;
+  odom.twist.twist.linear.x = body_velocity.x();
+  odom.twist.twist.linear.y = body_velocity.y();
+  odom.twist.twist.linear.z = body_velocity.z();
+  return odom;
+}
+
+nav_msgs::Odometry makeImuOdometry(const DynamicState& state) {
+  NavState nav;
+  nav.timestamp = state.time;
+  nav.R = SO3(state.R);
+  nav.p = state.p;
+  nav.v = state.v;
+  auto odom = makeImuOdometry(nav);
+  // 高频预测输出的角速度已在 IMU/body 系，不再旋转。
+  odom.twist.twist.angular.x = state.w.x();
+  odom.twist.twist.angular.y = state.w.y();
+  odom.twist.twist.angular.z = state.w.z();
+  return odom;
+}
+
 void LoadParamFromRos(ros::NodeHandle& nh){
   // 关键几何参数不能用缺省零值继续运行：错误配置必须在构造地图/滤波器前退出。
   const auto required = [&](const char* key, auto& value) {
@@ -187,6 +222,22 @@ std::string lidarTypeToString(int type) {
 }
 
 ROSWrapper::ROSWrapper(){
+  ros::NodeHandle private_nh("~");
+  std::string dataset_name;
+  private_nh.param<std::string>("dataset_name", dataset_name, std::string());
+  hawkins_input_ = (dataset_name == "Hawkins");
+  if (hawkins_input_) {
+    double lidar_frequency_hz = 0.0;
+    double imu_frequency_hz = 0.0;
+    private_nh.param("lidar_frequency_hz", lidar_frequency_hz, 0.0);
+    private_nh.param("imu_frequency_hz", imu_frequency_hz, 0.0);
+    ROS_INFO_STREAM("Dataset: Hawkins | LiDAR topic: " << g_lidar_topic
+        << " | IMU topic: " << g_imu_topic
+        << " | LiDAR type: " << lidarTypeToString(g_lidar_type)
+        << " | Point time field: time (relative seconds)"
+        << " | LiDAR frequency: " << lidar_frequency_hz << " Hz (nominal)"
+        << " | IMU frequency: " << imu_frequency_hz << " Hz (nominal)");
+  }
   ros::SubscribeOptions ops;
   ops.transport_hints = ros::TransportHints().tcpNoDelay();
   
@@ -237,6 +288,17 @@ inline bool validPoint(double x, double y, double z)
 
 void ROSWrapper::stdMsgHandler(const sensor_msgs::PointCloud2::ConstPtr& msg){
   if(msg->data.size() < 10) return;
+  if (hawkins_input_) {
+    // PCL otherwise initializes a missing field to zero, silently disabling deskew.
+    const auto time_field = std::find_if(msg->fields.begin(), msg->fields.end(),
+        [](const sensor_msgs::PointField& field) { return field.name == "time"; });
+    if (time_field == msg->fields.end() ||
+        time_field->datatype != sensor_msgs::PointField::FLOAT32 ||
+        time_field->count != 1) {
+      ROS_ERROR_THROTTLE(5.0, "Hawkins PointCloud2 requires a FLOAT32 per-point 'time' field in seconds");
+      return;
+    }
+  }
   
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -348,29 +410,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
   
   DynamicState imu_state, robo_state;
   if(eskf_->Predict(data, imu_state, robo_state)){
-    nav_msgs::Odometry odom_imu, odom_robo;
-
-    {
-      odom_imu.pose.pose.position.x = imu_state.p(0);
-      odom_imu.pose.pose.position.y = imu_state.p(1);
-      odom_imu.pose.pose.position.z = imu_state.p(2);
-
-      Quat q(imu_state.R);
-      q.normalize();
-
-      odom_imu.pose.pose.orientation.x = q.x();
-      odom_imu.pose.pose.orientation.y = q.y();
-      odom_imu.pose.pose.orientation.z = q.z();
-      odom_imu.pose.pose.orientation.w = q.w();
-
-      odom_imu.twist.twist.linear.x = imu_state.v(0);
-      odom_imu.twist.twist.linear.y = imu_state.v(1);
-      odom_imu.twist.twist.linear.z = imu_state.v(2);
-
-      odom_imu.twist.twist.angular.x = imu_state.w(0);
-      odom_imu.twist.twist.angular.y = imu_state.w(1);
-      odom_imu.twist.twist.angular.z = imu_state.w(2);
-    }
+    nav_msgs::Odometry odom_imu = makeImuOdometry(imu_state), odom_robo;
 
     {
       odom_robo.pose.pose.position.x = robo_state.p(0);
@@ -402,22 +442,7 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
 
 
 void ROSWrapper::pub_odom(const NavState& state){
-  nav_msgs::Odometry odom;
-  odom.header.frame_id = "world";
-  odom.header.stamp = ros::Time().fromSec(state.timestamp);
-  odom.pose.pose.position.x = state.p[0];
-  odom.pose.pose.position.y = state.p[1];
-  odom.pose.pose.position.z = state.p[2];
-
-  V4 temp_q = state.R.coeffs();
-  odom.pose.pose.orientation.x = temp_q[0];
-  odom.pose.pose.orientation.y = temp_q[1];
-  odom.pose.pose.orientation.z = temp_q[2];
-  odom.pose.pose.orientation.w = temp_q[3];
-
-  odom.twist.twist.linear.x = state.v[0];
-  odom.twist.twist.linear.y = state.v[1];
-  odom.twist.twist.linear.z = state.v[2];
+  const nav_msgs::Odometry odom = makeImuOdometry(state);
 
   pub_odom_.publish(odom);    // imu frame -> lidar frequency
 
@@ -444,6 +469,7 @@ void ROSWrapper::pub_odom(const NavState& state){
     /// nav_msgs::Path
     path_.header.stamp = odom.header.stamp;
     geometry_msgs::PoseStamped point;
+    point.header = odom.header; // 每个历史位姿保留自己的采样时间和 world 坐标系。
     point.pose = odom.pose.pose;
     path_.poses.push_back(point);
     pub_path_.publish(path_);

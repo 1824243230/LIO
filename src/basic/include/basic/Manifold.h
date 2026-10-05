@@ -152,8 +152,8 @@ public:
 
   template<typename OtherDerived>
   SE3(const Eigen::MatrixBase<OtherDerived>& rhs)  :
-  T_(rhs)
-  {}
+  SE3(M4(rhs))
+  {} // 与固定矩阵构造器共用初始化，避免 Eigen 表达式只赋值 T_。
 
   SE3& operator=(const SE3& rhs);
 

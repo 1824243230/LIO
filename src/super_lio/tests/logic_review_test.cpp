@@ -30,6 +30,26 @@ int main() {
   check(init.count==2 && init.mean_acc.x()==3 && other.count==0,"borrowed brackets deduplicated and instances isolated");
 
   g_gravity_norm=9.81;
+  // 建图和重定位现在共用该入口；验证正常时间锚点、偏置保留及首段传播。
+  ESKF initialized;
+  const V3 bg(0.1f,0.2f,0.3f), ba(0.01f,0.02f,0.03f);
+  initialized.SetInitialConditions(ESKF::Options(),bg,ba,1,V3(0,0,-9.81));
+  IMUData anchor; anchor.secs=1234.5;anchor.acc=ba+V3(0,0,9.81);anchor.gyr=bg;
+  const SE3 initial_pose(SO3::Exp(V3(0,0,0.3f)),V3(1,2,3));
+  initialized.SetPoseAtImu(initial_pose,anchor);
+  check(initialized.GetTime()==anchor.secs &&
+        (initialized.GetSysState().p-initial_pose.t_).norm()==0 &&
+        (initialized.GetSysState().R.R_-initial_pose.R_).norm()<1e-7 &&
+        (initialized.GetSysState().bg-bg).norm()==0 && (initialized.GetSysState().ba-ba).norm()==0,
+        "initial pose handoff uses matching IMU time and preserves initialized biases");
+  auto next=anchor; next.secs+=0.01;initialized.SetObsTime(next.secs);
+  check(initialized.Predict(next) && (initialized.GetSysState().p-initial_pose.t_).norm()<1e-6 &&
+        initialized.GetSysState().v.norm()<1e-6,"first prediction after registration uses actual IMU anchor");
+  auto invalid_state=initialized.GetSysState();invalid_state.timestamp=-1;
+  bool mismatch=false;
+  try { initialized.SetX(invalid_state,anchor); } catch(const std::invalid_argument&) { mismatch=true; }
+  check(mismatch && initialized.GetTime()==next.secs,"timestamp validation is retained, not bypassed for relocation");
+
   ESKF kf; ESKF::Options options;
   kf.SetInitialConditions(options,V3::Zero(),V3::Zero(),1,V3(0,0,-9.81));
   SysState state; state.timestamp=1;

@@ -57,6 +57,9 @@ public:
 
   using ObsFunc = std::function<void(const KFState& kf_state, BASIC::M6& HT_Vinv_H, BASIC::V6& HT_Vinv_r)>;
   bool UpdateObserve(ObsFunc obs, std::function<bool(const STATE&)> correction_guard = {});
+  // Fuse a zero world-frame velocity observation with Joseph covariance update.
+  // Returns false without changing the filter if any numerical check fails.
+  bool UpdateZeroVelocity(double velocity_std = 0.05);
 
   double GetTime() const { return current_time_; }
 
@@ -87,6 +90,8 @@ public:
   void SetX(const SysState& x);
   // 初始化必须同时给出状态时刻的真实 IMU，不能用默认零测量作积分左端点。
   void SetX(const SysState& x, const IMUData& imu);
+  // 建图与重定位共享初始化入口，状态时间始终取真实 IMU 时间。
+  void SetPoseAtImu(const BASIC::SE3& pose, const IMUData& imu);
 
   void SetCov(const COV& cov){ P_ = cov; }
 

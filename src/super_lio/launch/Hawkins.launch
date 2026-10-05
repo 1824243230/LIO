@@ -1,0 +1,75 @@
+<launch>
+  <arg name="rviz" default="true"/>
+  <arg name="decode_packets" default="true"/>
+  <arg name="lidar_frequency_hz" default="10.0"/>
+  <arg name="imu_frequency_hz" default="200.0"/>
+  <arg name="stationary_init" default="false"/>
+  <arg name="imu_ng" default="0.1"/>
+  <arg name="imu_na" default="0.1"/>
+  <arg name="imu_nbg" default="0.0001"/>
+  <arg name="imu_nba" default="0.0001"/>
+  <arg name="filter_rate" default="3"/>
+  <arg name="voxel_leaf" default="0.5"/>
+  <arg name="plane_huber_delta" default="0.0"/>
+  <arg name="velodyne_calibration" default="$(find velodyne_pointcloud)/params/VLP16db.yaml"/>
+  <!-- Source: official SubT_MRS_Hawkins_Long_Corridor_RC_Extrinsics.yaml,
+       https://drive.google.com/file/d/1bB3jfEJeTf_XoLUHKOaxCNF_MCkiQTol/view
+       laser_to_imu gives p_I = R_IL * p_L + t_IL, t=[0.08,0.029,0.03] m.
+       The published 3x3 has det=0.9984427, so its nearest proper SO(3)
+       rotation (SVD/polar projection) is used; see docs/hawkins_integration_report.md.
+       Format: [tx,ty,tz,r00,r10,r20,r01,r11,r21,r02,r12,r22]. -->
+  <arg name="lidar_imu" default="[0.080000000, 0.029000000, 0.030000000, 0.999991860, 0.000519624, -0.004001310, -0.000516138, 0.999999486, 0.000872217, 0.004001761, -0.000870145, 0.999991614]"/>
+
+  <!-- Bag recording time is in 2023; sensor message stamps are in 2018.
+       Super-LIO synchronizes by message stamps, not by rosbag /clock. -->
+  <param name="/use_sim_time" value="false"/>
+  <rosparam file="$(find super_lio)/config/Hawkins.yaml" command="load"/>
+  <param name="/lio/sensor/imu_ng" value="$(arg imu_ng)"/>
+  <param name="/lio/sensor/imu_na" value="$(arg imu_na)"/>
+  <param name="/lio/sensor/imu_nbg" value="$(arg imu_nbg)"/>
+  <param name="/lio/sensor/imu_nba" value="$(arg imu_nba)"/>
+  <param name="/lio/sensor/filter_rate" value="$(arg filter_rate)"/>
+  <param name="/lio/sensor/voxel_fliter_size" value="$(arg voxel_leaf)"/>
+  <param name="/lio/geometry/plane_huber_delta" value="$(arg plane_huber_delta)"/>
+  <rosparam param="/lio/extrinsic/lidar_imu" subst_value="true">$(arg lidar_imu)</rosparam>
+  <!-- Explicitly select the original estimator even if this ROS master has
+       parameters left by an earlier degeneracy or motion-compensation run. -->
+  <param name="/lio/motion/smooth_propagation" value="false"/>
+  <param name="/lio/motion/uncertainty_aware" value="false"/>
+  <param name="/lio/imu_init/require_stationary" value="$(arg stationary_init)"/>
+  <param name="/lio/geometry/enable_degeneracy" value="false"/>
+  <param name="/lio/geometry/enable_spectral_reliability" value="false"/>
+  <param name="/lio/geometry/enable_bump_layer" value="false"/>
+  <param name="/lio/geometry/enable_informed_sampling" value="false"/>
+  <param name="/lio/geometry/enable_bump_measurement" value="false"/>
+  <param name="/lio/geometry/csv_path" value=""/>
+
+  <!-- Decode existing /velodyne_packets only. Do not start the UDP driver or
+       LaserScan nodelet included by velodyne_pointcloud/VLP16_points.launch. -->
+  <group if="$(arg decode_packets)">
+    <node pkg="nodelet" type="nodelet" name="hawkins_velodyne_manager"
+          args="manager" output="screen"/>
+    <include file="$(find velodyne_pointcloud)/launch/transform_nodelet.launch">
+      <arg name="manager" value="hawkins_velodyne_manager"/>
+      <arg name="model" value="VLP16"/>
+      <arg name="calibration" value="$(arg velodyne_calibration)"/>
+      <arg name="fixed_frame" value=""/>
+      <arg name="target_frame" value=""/>
+      <arg name="min_range" value="0.4"/>
+      <arg name="max_range" value="100.0"/>
+      <arg name="organize_cloud" value="false"/>
+    </include>
+  </group>
+
+  <!-- The ROSWrapper VELO16 path subscribes to /velodyne_points and /imu/data. -->
+  <node pkg="super_lio" type="super_lio_node" name="lio_node" output="screen" required="true">
+    <param name="dataset_name" value="Hawkins"/>
+    <param name="lidar_frequency_hz" value="$(arg lidar_frequency_hz)"/>
+    <param name="imu_frequency_hz" value="$(arg imu_frequency_hz)"/>
+  </node>
+
+  <group if="$(arg rviz)">
+    <node pkg="rviz" type="rviz" name="super_lio"
+          args="-d $(find super_lio)/rviz/lio.rviz"/>
+  </group>
+</launch>

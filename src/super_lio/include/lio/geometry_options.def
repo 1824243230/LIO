@@ -4,6 +4,8 @@ GOPT(bool, enable_degeneracy, false)
 GOPT(bool, enable_spectral_reliability, false)
 // 相对最大特征值达到此比例后不再降权；无量纲，尚需真实退化数据标定。
 GOPT(double, spectral_full_ratio, 0.02)
+// Optional point-to-plane Huber threshold in metres. Zero keeps the original precision.
+GOPT(double, plane_huber_delta, 0.0)
 GOPT(bool, enable_bump_layer, false)
 GOPT(bool, enable_informed_sampling, false)
 GOPT(bool, enable_bump_measurement, false)
@@ -29,6 +31,8 @@ GOPT(double, coarse_resolution, 0.5)
 GOPT(double, mid_threshold, 0.005)
 GOPT(int, informed_top_k_voxels, 100)
 GOPT(int, max_bump_constraints, 200)
+// Optional spatial diversity gate; zero preserves the existing global Top-K behavior.
+GOPT(int, max_bumps_per_voxel, 0)
 GOPT(double, bump_min_mid, 0.003)
 GOPT(double, bump_min_gradient, 0.03)
 GOPT(double, bump_min_pixel_confidence, 0.1)

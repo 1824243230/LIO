@@ -13,6 +13,9 @@
 #include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #include <Eigen/Core>
 
@@ -179,6 +182,9 @@ public:
 
   void SetOptions(const Options& options)
   {
+    if (!std::isfinite(options.resolution) || options.resolution <= 0 ||
+        !std::isfinite(2.0f/options.resolution) || options.capacity == 0)
+      throw std::invalid_argument("OctVoxMap requires a finite positive resolution and nonzero capacity");
     resolution_ = options.resolution;
     capacity_ = options.capacity;
     inv_resolution_ = 1.0 / resolution_;
@@ -219,8 +225,19 @@ public:
 
 
 private:
+  bool pointToFineKey(const Point& point, KEY& fine_key) const {
+    // 三个入口使用同一种索引规则。先保留原浮点乘法/取整语义，再在 double
+    // 中检查 int 边界；用 float 比较 INT_MAX 会把上界舍入到非法的 2^31。
+    const Eigen::Vector3d cell = (point * sub_inv_resolution_).array().floor().template cast<double>();
+    if (!cell.allFinite() ||
+        (cell.array() < double(std::numeric_limits<int>::min())).any() ||
+        (cell.array() > double(std::numeric_limits<int>::max())).any()) return false;
+    fine_key = cell.template cast<int>();
+    return true;
+  }
+
   float resolution_ = 0.5;
-  float inv_resolution_ = 1.0;
+  float inv_resolution_ = 2.0; // 与默认 resolution_=0.5 保持互为倒数。
   float sub_resolution_ = 0.25;
   float sub_inv_resolution_ = 4.0;
   std::size_t capacity_ = 1000000;
@@ -273,7 +290,8 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
   }
 
   for(auto& pt : cloud_world){
-    KEY fine_key = (pt * sub_inv_resolution_).array().floor().template cast<int>();
+    KEY fine_key;
+    if (!pointToFineKey(pt, fine_key)) continue;
     KEY key;
     key[0] = fine_key[0] >> 1;
     key[1] = fine_key[1] >> 1;
@@ -291,7 +309,8 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
         std::forward_as_tuple(pt, local_idx));
       grids_.insert(std::make_pair(key, data_.begin()));
       
-      if (data_.size() >= capacity_) {
+      // 恰好达到容量时仍应保留；只有新插入导致超出上限才淘汰 LRU。
+      if (data_.size() > capacity_) {
         grids_.erase(data_.back().first);
         data_.pop_back();
       }
@@ -305,7 +324,8 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
 
 template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::getTopK(const Point& point, KNNHeapType& top_K) const {
-  const KEY fine_key = (point * sub_inv_resolution_).array().floor().template cast<int>();
+  KEY fine_key;
+  if (!pointToFineKey(point, fine_key)) return;
   KEY key;
   key[0] = fine_key[0] >> 1;
   key[1] = fine_key[1] >> 1;
@@ -373,7 +393,10 @@ void OctVoxMap<Point, Scalar>::getTopK(const Point& point, KNNHeapType& top_K) c
     }
 
     if (top_K.count == 5)
-      if (top_K.max_dist2_ < orders_min_dis2[group_idx]){
+      // 查找表以 0.5 m 主体素 / 0.25 m 子体素为基准；距离平方必须
+      // 随当前分辨率平方缩放，否则小体素会过早停止，漏掉更近的点。
+      if (top_K.max_dist2_ < orders_min_dis2[group_idx] *
+                            (resolution_/0.5f) * (resolution_/0.5f)){
         break;
       }
 
@@ -383,7 +406,14 @@ void OctVoxMap<Point, Scalar>::getTopK(const Point& point, KNNHeapType& top_K) c
 
 template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::getTopK_VN(const Point& point, KNNHeapType& top_K) const{
-  KEY key = (point * inv_resolution_).array().floor().template cast<int>();
+  KEY fine_key;
+  if (!pointToFineKey(point, fine_key)) return;
+  // 从与插入相同的子体素键得到主体素键。除以 2 后还为邻居的 ±1/±2
+  // 偏移留下整型空间，避免查询在 int 极值附近做加法时溢出。
+  KEY key;
+  key[0] = fine_key[0] >> 1;
+  key[1] = fine_key[1] >> 1;
+  key[2] = fine_key[2] >> 1;
 
   std::vector<OctVoxType*> voxels_2_search;
   voxels_2_search.reserve(19);
@@ -500,6 +530,9 @@ template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::clear() {
   grids_.clear();
   data_.clear();
+  // resetMap 随后会立即插入替换地图，不能被上一张地图的禁写倒计时拦截。
+  reset_map_ = false;
+  reset_map_count_ = 0;
 }
 
 

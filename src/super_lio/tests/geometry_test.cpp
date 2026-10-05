@@ -1,4 +1,5 @@
 #include "lio/geometry.h"
+#include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <iostream>
 #include <stdexcept>
@@ -7,8 +8,17 @@ using namespace LI2Sup::geometry;
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 int main() {
   Options o;
-  check(o.valid(0.5), "default options");
+  check(o.valid(0.5) && o.max_bumps_per_voxel==0 && o.plane_huber_delta==0,
+        "default options preserve the original plane precision and uncapped voxel selection");
   Options bad = o; bad.sigma_b_min = -1; check(!bad.valid(0.5), "invalid variance");
+  bad = o; bad.plane_huber_delta = -0.01;
+  check(!bad.valid(0.5), "negative plane Huber threshold rejected");
+  bad = o; bad.plane_huber_delta = std::numeric_limits<double>::quiet_NaN();
+  check(!bad.valid(0.5), "nonfinite plane Huber threshold rejected");
+  bad = o; bad.plane_huber_delta = 0.1;
+  check(bad.valid(0.5), "positive plane Huber threshold accepted");
+  bad = o; bad.max_bumps_per_voxel = -1;
+  check(!bad.valid(0.5), "negative per-voxel bump cap rejected");
   Analyzer analyzer;
   M6 G = M6::Identity();
   check(analyzer.analyze(G,o,true).status == Status::NORMAL, "normal geometry");
@@ -181,6 +191,32 @@ int main() {
   expected_rhs-=replacement.J*replacement.residual/replacement.variance;
   check(selected.size()==1 && (mixed_info-expected_info).norm()<1e-12 &&
         (mixed_rhs-expected_rhs).norm()<1e-12,"exclusive stack removes exactly one plane row and deduplicates");
+  // Huber changes both Hessian and rhs; bump replacement must remove the
+  // robust plane precision rather than an unweighted nominal plane row.
+  const double plane_delta = 0.1;
+  std::vector<double> robust_precisions(plane_rows.size());
+  M6 robust_info=M6::Zero(); V6 robust_rhs=V6::Zero();
+  for (size_t i=0;i<plane_rows.size();++i) {
+    robust_precisions[i] = 1000.0*huberWeight(residuals[i],plane_delta);
+    robust_info += robust_precisions[i]*plane_rows[i]*plane_rows[i].transpose();
+    robust_rhs -= robust_precisions[i]*plane_rows[i]*residuals[i];
+  }
+  const M6 information_removed = original_info - robust_info;
+  check(robust_precisions[0]==1000.0 &&
+        std::abs(robust_precisions[1]-500.0)<1e-12 &&
+        robust_precisions[2]<robust_precisions[1] &&
+        Eigen::SelfAdjointEigenSolver<M6>(information_removed).eigenvalues().minCoeff()>-1e-10,
+        "plane Huber preserves inliers and only removes outlier information");
+  mixed_info=robust_info; mixed_rhs=robust_rhs; selected={replacement};
+  applyExclusiveBumps(plane_rows,residuals,valid_planes,selected,mixed_info,mixed_rhs,
+                      1000.0,&robust_precisions);
+  expected_info=robust_info-robust_precisions[1]*plane_rows[1]*plane_rows[1].transpose()
+                +replacement.J*replacement.J.transpose()/replacement.variance;
+  expected_rhs=robust_rhs+robust_precisions[1]*plane_rows[1]*residuals[1]
+               -replacement.J*replacement.residual/replacement.variance;
+  check(selected.size()==1 && (mixed_info-expected_info).norm()<1e-10 &&
+        (mixed_rhs-expected_rhs).norm()<1e-10,
+        "bump replacement removes the actual Huber-weighted plane row");
   // Identical bump/plane rows at identical precision must not double their information.
   replacement.J=plane_rows[1]; replacement.residual=residuals[1]; replacement.variance=0.001;
   mixed_info=original_info; mixed_rhs=original_rhs; selected={replacement};
@@ -248,6 +284,33 @@ int main() {
   ranked=original_ranked;
   selectWeakDirectionConstraints(ranked,DegeneracyResult{},select_options);
   check(ranked.empty(),"invalid geometry clears final bump selection");
+
+  auto voxel_candidate = [&](size_t index, double score, Key key) {
+    Candidate c=ranked_candidate(index,score);
+    c.voxel_key=key; c.has_voxel_key=true;
+    return c;
+  };
+  const std::vector<Candidate> clustered={voxel_candidate(10,0.95,{0,0,0}),
+    voxel_candidate(11,0.9,{0,0,0}), voxel_candidate(12,0.85,{1,0,0}),
+    voxel_candidate(3,0.85,{1,0,0}), voxel_candidate(13,0.8,{2,0,0})};
+  select_options.max_bump_constraints=3;
+  ranked=clustered;
+  selectWeakDirectionConstraints(ranked,oblique,select_options);
+  check(ranked.size()==3 && ranked[0].index==10 && ranked[1].index==11 && ranked[2].index==3,
+        "zero per-voxel cap keeps original quality and index ordering");
+  select_options.max_bumps_per_voxel=1;
+  ranked=clustered;
+  selectWeakDirectionConstraints(ranked,oblique,select_options);
+  check(ranked.size()==3 && ranked[0].index==10 && ranked[1].index==3 && ranked[2].index==13,
+        "spatial cap takes highest-quality candidate per voxel before global Top-K");
+  ranked=original_ranked; select_options.max_bump_constraints=2;
+  selectWeakDirectionConstraints(ranked,oblique,select_options);
+  check(ranked.size()==2 && ranked[0].index==2 && ranked[1].index==1,
+        "unkeyed hand-built candidates retain previous selection behavior");
+  select_options.max_bumps_per_voxel=-1;
+  ranked=clustered;
+  selectWeakDirectionConstraints(ranked,oblique,select_options);
+  check(ranked.empty(), "invalid negative voxel cap cannot silently select constraints");
 
   double previous_variance=std::numeric_limits<double>::infinity(), adaptive_variance=0;
   for(double q : {0.0,0.001,0.01,0.1,0.5,1.0}) {
@@ -412,6 +475,7 @@ int main() {
   map.insert(points,V3::Zero());
   V3 p(0.2213,0.2337,0.2);
   check(map.query(p,query) && query.mid>0 && query.gradient>0, "ripple query");
+  check(query.has_voxel_key && query.voxel_key==map.key(p), "map query records its source voxel");
   for(int k=0;k<3;++k) {
     Surface a,b; V3 pa=p,pb=p; pa[k]+=1e-6; pb[k]-=1e-6;
     check(map.query(pa,a) && map.query(pb,b), "bilinear neighbors");
@@ -431,7 +495,8 @@ int main() {
     check(map.query(rp*mapped_body+tp,a) && map.query(rm*mapped_body+tm,b), "pose query neighbors");
     check(std::abs((a.residual-b.residual)/(2*eps)-map_J[k])<1e-6, "full bump pose Jacobian");
   }
-  check(!map.query(V3(5,5,5),query), "unobserved query fallback");
+  check(!map.query(V3(5,5,5),query) && !query.has_voxel_key,
+        "unobserved query fallback clears source voxel");
   Options bounded=o; bounded.bump_capacity=2;
   BumpMap small(bounded,0.5);
   small.insert({V3(0,0,0),V3(1,0,0),V3(2,0,0)},V3::Zero());
